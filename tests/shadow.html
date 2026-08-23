@@ -1,0 +1,7 @@
+<!doctype html><meta charset="utf-8"><title>Shadow player</title>
+<div id="holder"></div>
+<script>
+const h=document.getElementById('holder');
+const sr=h.attachShadow({mode:'open'});
+setTimeout(()=>{ sr.innerHTML='<video src="video.webm" width="480" height="270" controls muted></video>'; },800);
+</script>

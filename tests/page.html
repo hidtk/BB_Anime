@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><title>Тестовый плеер</title>
+<style>
+ body{background:#111;color:#ddd;font-family:sans-serif;margin:0;padding:20px}
+ #player{width:640px;height:360px;background:#000;display:flex;align-items:center;justify-content:center;color:#666}
+ video{width:640px;height:360px;background:#000;display:block}
+ button{padding:8px 12px;margin-top:12px}
+ .spacer{height:400px}
+</style></head>
+<body>
+<h3>Псевдо-SPA плеер (видео появляется позже и пересоздаётся)</h3>
+<div id="player">Loading stream...</div>
+<button id="next">Следующая серия (пересоздать &lt;video&gt;)</button>
+<button id="fs">Полный экран</button>
+<div class="spacer"></div>
+<script>
+function mount(){
+  const p=document.getElementById('player');
+  p.innerHTML='';
+  const v=document.createElement('video');
+  v.src='video.webm'; v.controls=true; v.muted=true; v.id='v'+Date.now();
+  p.appendChild(v);
+  window.__v=v;
+}
+setTimeout(mount,1200);
+document.getElementById('next').addEventListener('click',mount);
+document.getElementById('fs').addEventListener('click',function(){
+  var el=window.__v||document.getElementById('player');
+  (el.requestFullscreen?el.requestFullscreen():el.webkitRequestFullscreen()).catch(function(e){console.log('fs fail',e.message)});
+});
+</script>
+</body></html>
