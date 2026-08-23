@@ -1,0 +1,7 @@
+node_modules/
+package-lock.json
+results.json
+shot-*.png
+*.zip
+tests/video.webm
+.DS_Store
