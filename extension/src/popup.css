@@ -1,0 +1,38 @@
+* { box-sizing: border-box; }
+body {
+  width: 320px; margin: 0; padding: 12px;
+  font: 13px/1.4 -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  background: #17181c; color: #e9eaee;
+}
+h1 { margin: 0 0 4px; font-size: 14px; font-weight: 700; }
+header { margin-bottom: 10px; }
+.status { font-size: 12px; color: #a5a8b3; }
+.status.warn { color: #ffbf5f; }
+.status.good { color: #7fdc9a; }
+.block { border-top: 1px solid #292b32; padding-top: 10px; margin-top: 10px; }
+.block:first-of-type { border-top: 0; margin-top: 0; padding-top: 0; }
+.lbl { display: block; font-size: 12px; color: #a5a8b3; margin: 8px 0 4px; }
+.lbl:first-child { margin-top: 0; }
+button {
+  font: inherit; border: 0; border-radius: 6px; padding: 8px 10px;
+  background: #2c2f38; color: #e9eaee; cursor: pointer;
+}
+button:hover { background: #363a45; }
+button.primary { width: 100%; background: #3d6bff; color: #fff; font-weight: 600; }
+button.primary:hover { background: #4d78ff; }
+button.ghost { background: transparent; border: 1px solid #3a3d47; color: #b9bcc7; }
+button.sm { padding: 5px 8px; font-size: 12px; }
+.row { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+.row.wrap { flex-wrap: wrap; gap: 10px; }
+output { min-width: 74px; text-align: center; font-weight: 700; font-variant-numeric: tabular-nums; }
+select { width: 100%; padding: 6px; border-radius: 6px; background: #2c2f38; color: #e9eaee; border: 1px solid #3a3d47; }
+input[type=range] { width: 100%; accent-color: #3d6bff; }
+.chk { display: flex; align-items: center; gap: 5px; font-size: 12px; color: #b9bcc7; }
+.hint { color: #83879a; margin-top: 6px; }
+.diag { font-size: 11px; color: #7b7f8c; margin-top: 4px; line-height: 1.35; }
+.diag:empty { display: none; }
+.fileinfo { margin-top: 8px; font-size: 12px; color: #cfd2da; word-break: break-all; }
+.fileinfo b { color: #fff; }
+.current { margin-top: 8px; font-size: 12px; color: #9ea2ae; min-height: 16px; font-style: italic; }
+#clearBtn { margin-top: 8px; width: 100%; }
+.hidden { display: none !important; }
