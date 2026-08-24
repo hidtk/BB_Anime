@@ -321,10 +321,235 @@
     apply(await ping());
   });
 
+
+  // ---------- поиск на opensubtitles.com ----------
+
+  var os = {
+    toggle: document.getElementById('osToggle'),
+    panel: document.getElementById('osPanel'),
+    query: document.getElementById('osQuery'),
+    season: document.getElementById('osSeason'),
+    episode: document.getElementById('osEpisode'),
+    search: document.getElementById('osSearch'),
+    showRow: document.getElementById('osShowRow'),
+    show: document.getElementById('osShow'),
+    status: document.getElementById('osStatus'),
+    results: document.getElementById('osResults')
+  };
+  var osBusy = false;
+  var osShows = [];
+
+  function osSay(text, kind) {
+    os.status.textContent = text || '';
+    os.status.className = 'hint' + (kind === 'warn' ? ' warn' : '');
+  }
+
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  function tabsCreate(url) {
+    return new Promise(function (r) { chrome.tabs.create({ url: url, active: false }, function (t) { r(t); }); });
+  }
+  function tabsUpdate(id, url) {
+    return new Promise(function (r) { chrome.tabs.update(id, { url: url }, function (t) { void chrome.runtime.lastError; r(t); }); });
+  }
+  function tabsRemove(id) {
+    return new Promise(function (r) { chrome.tabs.remove(id, function () { void chrome.runtime.lastError; r(); }); });
+  }
+  function sendTab(id, msg) {
+    return new Promise(function (r) {
+      chrome.tabs.sendMessage(id, msg, { frameId: 0 }, function (res) {
+        if (chrome.runtime.lastError) return r(null);
+        r(res || null);
+      });
+    });
+  }
+  function rememberTempTab(id) {
+    try { chrome.storage.local.set({ osTempTab: id || null }, function () { void chrome.runtime.lastError; }); } catch (e) {}
+  }
+  function cleanupTempTab() {
+    try {
+      chrome.storage.local.get('osTempTab', function (res) {
+        if (chrome.runtime.lastError) return;
+        var id = res && res.osTempTab;
+        if (id) { chrome.tabs.remove(id, function () { void chrome.runtime.lastError; }); rememberTempTab(null); }
+      });
+    } catch (e) {}
+  }
+
+  // Ждём, пока вкладка догрузится и в ней ответит наш content script.
+  async function waitTabReady(id, timeoutMs) {
+    var until = Date.now() + (timeoutMs || 20000);
+    while (Date.now() < until) {
+      var res = await sendTab(id, { type: 'OS_PING' });
+      if (res && res.ok && res.ready === 'complete') return true;
+      await sleep(400);
+    }
+    return false;
+  }
+
+  function renderShows(list) {
+    osShows = list;
+    if (list.length < 2) { os.show.classList.add('hidden'); os.showRow.classList.add('hidden'); return; }
+    os.show.innerHTML = '';
+    list.forEach(function (s, i) {
+      var o = document.createElement('option');
+      o.value = String(i);
+      o.textContent = (s.isSeries ? 'Сериал: ' : 'Фильм: ') + s.title;
+      os.show.appendChild(o);
+    });
+    os.show.classList.remove('hidden');
+    os.showRow.classList.remove('hidden');
+  }
+
+  function renderLanguages(data) {
+    os.results.innerHTML = '';
+    var langs = (data && data.languages) || [];
+    if (!langs.length) {
+      var empty = document.createElement('div');
+      empty.className = 'osempty';
+      empty.textContent = 'Субтитров для этой серии не нашлось.';
+      os.results.appendChild(empty);
+      return;
+    }
+    langs.forEach(function (l) {
+      var row = document.createElement('div');
+      row.className = 'osrow';
+
+      var lang = document.createElement('span');
+      lang.className = 'lang';
+      lang.textContent = l.label + (l.code ? ' (' + l.code + ')' : '');
+      row.appendChild(lang);
+
+      var cnt = document.createElement('span');
+      cnt.className = 'cnt';
+      cnt.textContent = '×' + l.count;
+      row.appendChild(cnt);
+
+      var rel = document.createElement('span');
+      rel.className = 'rel';
+      rel.title = l.best ? l.best.release : '';
+      rel.textContent = l.best ? l.best.release : '';
+      row.appendChild(rel);
+
+      if (l.best) {
+        var take = document.createElement('button');
+        take.textContent = 'Взять';
+        take.title = 'Скачать и сразу наложить на видео';
+        take.addEventListener('click', function () { osTake(l.best.url, take); });
+        row.appendChild(take);
+
+        var open = document.createElement('a');
+        open.href = l.best.url;
+        open.target = '_blank';
+        open.rel = 'noreferrer';
+        open.textContent = 'открыть';
+        row.appendChild(open);
+      }
+      os.results.appendChild(row);
+    });
+  }
+
+  async function osRun() {
+    if (osBusy) return;
+    var q = os.query.value.trim();
+    if (!q) { osSay('Введите название сериала или фильма.', 'warn'); return; }
+    var season = os.season.value.trim();
+    var episode = os.episode.value.trim();
+
+    osBusy = true;
+    os.search.disabled = true;
+    os.results.innerHTML = '';
+    var tab = null;
+    try {
+      osSay('Открываю поиск на opensubtitles.com…');
+      tab = await tabsCreate(OpenSubs.buildTitleSearchUrl(q));
+      rememberTempTab(tab.id);
+      if (!await waitTabReady(tab.id, 25000)) {
+        throw new Error('Сайт не ответил. Откройте opensubtitles.com вручную один раз (принять cookie) и попробуйте снова.');
+      }
+
+      var url;
+      if (season && episode) {
+        var info = await sendTab(tab.id, { type: 'OS_SHOWS' });
+        var list = ((info && info.shows) || []);
+        var series = list.filter(function (s) { return s.isSeries; });
+        var pool = series.length ? series : list;
+        if (!pool.length) throw new Error('По этому названию на сайте ничего не нашлось.');
+        renderShows(pool);
+        var idx = parseInt(os.show.value, 10);
+        var chosen = pool[isFinite(idx) && pool[idx] ? idx : 0];
+
+        osSay('Открываю «' + chosen.title + '»…');
+        await tabsUpdate(tab.id, chosen.url);
+        if (!await waitTabReady(tab.id, 25000)) throw new Error('Страница сериала не открылась.');
+        var showInfo = await sendTab(tab.id, { type: 'OS_SHOWS' });
+        var showId = showInfo && showInfo.showId;
+        if (!showId) throw new Error('Не удалось определить сериал в базе сайта.');
+        url = OpenSubs.buildEpisodeSearchUrl(showId, season, episode);
+        osSay('Смотрю сезон ' + season + ', серию ' + episode + '…');
+        await tabsUpdate(tab.id, url);
+        if (!await waitTabReady(tab.id, 25000)) throw new Error('Страница результатов не открылась.');
+      } else {
+        osSay('Собираю языки по названию (сезон и серию можно указать для точности)…');
+      }
+
+      var data = await sendTab(tab.id, { type: 'OS_COLLECT' });
+      if (!data || !data.ok) throw new Error('Не удалось разобрать страницу результатов.');
+      renderLanguages(data);
+      var total = data.total ? data.total : data.rows.length;
+      osSay('Найдено вариантов: ' + total + ', языков: ' + data.languages.length + '.');
+    } catch (e) {
+      osSay((e && e.message) || String(e), 'warn');
+    } finally {
+      if (tab) { await tabsRemove(tab.id); rememberTempTab(null); }
+      os.search.disabled = false;
+      osBusy = false;
+    }
+  }
+
+  async function osTake(subtitleUrl, btn) {
+    if (osBusy) return;
+    if (!target) { osSay('Сначала откройте вкладку с видео — субтитры некуда накладывать.', 'warn'); return; }
+    osBusy = true;
+    var old = btn.textContent;
+    btn.textContent = '…';
+    btn.disabled = true;
+    var tab = null;
+    try {
+      osSay('Открываю страницу субтитров…');
+      tab = await tabsCreate(subtitleUrl);
+      rememberTempTab(tab.id);
+      if (!await waitTabReady(tab.id, 25000)) throw new Error('Страница субтитров не открылась.');
+      osSay('Скачиваю файл…');
+      var res = await sendTab(tab.id, { type: 'OS_FETCH' });
+      if (!res || !res.ok) throw new Error((res && res.error) || 'Скачать не удалось.');
+      await action({ type: 'LOAD_TEXT', text: res.text, name: res.name, encoding: res.encoding });
+      osSay('Загружено: ' + res.name + ' — ' + res.count + ' реплик.');
+      setTimeout(async function () { apply(await ping()); }, 200);
+    } catch (e) {
+      osSay((e && e.message) || String(e), 'warn');
+    } finally {
+      if (tab) { await tabsRemove(tab.id); rememberTempTab(null); }
+      btn.textContent = old;
+      btn.disabled = false;
+      osBusy = false;
+    }
+  }
+
+  os.toggle.addEventListener('click', function () {
+    os.panel.classList.toggle('hidden');
+    if (!os.panel.classList.contains('hidden')) os.query.focus();
+  });
+  os.search.addEventListener('click', osRun);
+  [os.query, os.season, os.episode].forEach(function (el) {
+    el.addEventListener('keydown', function (e) { if (e.key === 'Enter') osRun(); });
+  });
+
   // ---------- запуск ----------
 
   (async function init() {
     chrome.storage.sync.get(DEFAULTS, function (s) { applySettingsUI(Object.assign({}, DEFAULTS, s || {})); });
+    cleanupTempTab();
     var found = await resolveTab();
     if (found.id == null) {
       el.status.textContent = 'Откройте вкладку с видео.';

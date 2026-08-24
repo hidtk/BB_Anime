@@ -70,6 +70,15 @@
 
   // ---------------- поиск видео ----------------
 
+  var lastShadowScan = 0;
+  var everHadVideo = false;
+
+  // Пока плеера на странице нет — ищем часто (он может появиться в любой момент).
+  // Как только видео хоть раз нашлось, обход Shadow DOM можно сильно разредить.
+  function shadowScanInterval() {
+    return everHadVideo ? 3000 : 600;
+  }
+
   function collectVideos() {
     var found = [];
     var seen = new Set();
@@ -77,11 +86,25 @@
     try {
       document.querySelectorAll('video').forEach(add);
     } catch (e) {}
-    // видео внутри open shadow root (кастомные плееры)
-    try {
-      scanShadow(document.documentElement, 0, add);
-    } catch (e) {}
+    // Обход Shadow DOM дорогой (querySelectorAll('*') по всему документу),
+    // поэтому только если обычным способом видео не нашлось, и не чаще
+    // раза в полторы секунды — иначе на «живых» SPA это жжёт процессор.
+    if (!found.length) {
+      var now = nowMs();
+      if (now - lastShadowScan >= shadowScanInterval()) {
+        lastShadowScan = now;
+        try { scanShadow(document.documentElement, 0, add); } catch (e) {}
+      } else if (shadowCache.length) {
+        shadowCache.forEach(function (v) { if (v.isConnected) add(v); });
+      }
+    }
     return found;
+  }
+
+  var shadowCache = [];
+
+  function nowMs() {
+    return (window.performance && performance.now) ? performance.now() : Date.now();
   }
 
   function scanShadow(root, depth, add) {
@@ -90,9 +113,15 @@
     for (var i = 0; i < els.length; i++) {
       var sr = els[i].shadowRoot;
       if (sr) {
-        sr.querySelectorAll('video').forEach(add);
+        sr.querySelectorAll('video').forEach(function (v) {
+          if (shadowCache.indexOf(v) === -1) shadowCache.push(v);
+          add(v);
+        });
         scanShadow(sr, depth + 1, add);
       }
+    }
+    if (depth === 0) {
+      shadowCache = shadowCache.filter(function (v) { return v.isConnected; });
     }
   }
 
@@ -134,12 +163,31 @@
     return state.videos;
   }
 
+  var discoveryTimer = 0;
+
+  // MutationObserver не видит изменения внутри shadow root, поэтому пока
+  // плеер не найден, раз в секунду перепроверяем страницу. Как только видео
+  // появилось — опрос останавливается и ничего не стоит.
+  function ensureDiscoveryPoll() {
+    if (state.video && state.video.isConnected) {
+      if (discoveryTimer) { clearInterval(discoveryTimer); discoveryTimer = 0; }
+      return;
+    }
+    if (discoveryTimer) return;
+    discoveryTimer = setInterval(function () {
+      if (document.hidden) return;
+      refreshVideos();
+      if (state.video) { clearInterval(discoveryTimer); discoveryTimer = 0; }
+    }, 1000);
+  }
+
   function attachTo(v) {
     detachEvents();
     state.video = v || null;
     state.lastHtml = null;
     state.lastRect = null;
-    if (state.video) attachEvents();
+    if (state.video) { attachEvents(); everHadVideo = true; }
+    ensureDiscoveryPoll();
     render(true);
     if (state.video && state.pendingRestore && !state.cues.length) applyRestore(state.pendingRestore);
   }
@@ -169,12 +217,31 @@
     }, 300);
   }
 
+  function touchesVideo(nodes) {
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      if (!n || n.nodeType !== 1) continue;
+      if (n.tagName === 'VIDEO') return true;
+      try { if (n.querySelector && n.querySelector('video')) return true; } catch (e) {}
+      if (n.shadowRoot) return true;
+    }
+    return false;
+  }
+
   try {
     new MutationObserver(function (muts) {
-      for (var i = 0; i < muts.length; i++) {
-        var m = muts[i];
-        if (m.addedNodes.length || m.removedNodes.length) { scheduleRescan(); return; }
+      // На «живых» SPA мутации летят сотнями в секунду: пересканируем только
+      // если видео пропало, ещё не найдено или в DOM появился новый плеер.
+      var needScan = !state.video || !state.video.isConnected;
+      if (!needScan) {
+        for (var i = 0; i < muts.length; i++) {
+          if (touchesVideo(muts[i].addedNodes) || touchesVideo(muts[i].removedNodes)) {
+            needScan = true;
+            break;
+          }
+        }
       }
+      if (needScan) scheduleRescan();
     }).observe(document.documentElement, { childList: true, subtree: true });
   } catch (e) {}
 
@@ -375,29 +442,11 @@
     host.style.setProperty('opacity', visible ? '1' : '0', 'important');
 
     var t = v.currentTime - state.shift;
-    var html = activeHtml(t);
+    var html = SubParse.activeHtml(state.cues, t);
     if (html !== state.lastHtml) {
       state.lastHtml = html;
       textEl.innerHTML = html;
     }
-  }
-
-  function activeHtml(t) {
-    var cues = state.cues;
-    if (!cues.length) return '';
-    var lo = 0, hi = cues.length - 1, idx = -1;
-    while (lo <= hi) {
-      var mid = (lo + hi) >> 1;
-      if (cues[mid].start <= t) { idx = mid; lo = mid + 1; } else hi = mid - 1;
-    }
-    if (idx === -1) return '';
-    var parts = [];
-    for (var i = idx; i >= 0 && i > idx - 40; i--) {
-      var c = cues[i];
-      if (c.end > t && c.start <= t) parts.unshift(c.html);
-      else if (c.start < t - 60) break;
-    }
-    return parts.join('<br>');
   }
 
   window.addEventListener('resize', function () { state.lastRect = null; render(true); }, true);
@@ -462,6 +511,7 @@
 
   function clearSubs() {
     state.cues = [];
+    state.pendingRestore = null;
     state.fileName = '';
     state.format = '';
     state.fromMemory = false;
@@ -554,6 +604,7 @@
   window.addEventListener('message', function (e) {
     var d = e && e.data;
     if (!d || d.__subOverlay !== HOTKEY_MSG || !d.action) return;
+    if (!isParentWindow(e.source)) return; // только «сверху вниз»
     if (!applyHotkey(d.action)) broadcastHotkey(d.action);
   });
 
@@ -693,18 +744,34 @@
     setTimeout(function () { delete pending[id]; cb(box.list); }, waitMs || 220);
   }
 
+  // Сообщения приходят из любого окна, в том числе от скриптов самого сайта.
+  // Поэтому принимаем только то, что пришло сверху (от родительского фрейма)
+  // или снизу (ответ от собственного дочернего фрейма).
+  function isParentWindow(src) {
+    return !!src && src === window.parent && window.parent !== window;
+  }
+  function isChildWindow(src) {
+    if (!src) return false;
+    var kids = childWindows();
+    for (var i = 0; i < kids.length; i++) if (kids[i] === src) return true;
+    return false;
+  }
+
   window.addEventListener('message', function (e) {
     var d = e && e.data;
     if (!d || d.__subOverlay !== RPC) return;
     if (d.kind === 'query') {
+      if (!isParentWindow(e.source)) return;
       var src = e.source;
       gather(function (list) {
         try { src.postMessage({ __subOverlay: RPC, kind: 'reply', id: d.id, list: list }, '*'); } catch (err) {}
       }, 120);
     } else if (d.kind === 'reply') {
+      if (!isChildWindow(e.source)) return;
       var box = pending[d.id];
       if (box && d.list && d.list.length) box.list = box.list.concat(d.list);
     } else if (d.kind === 'action') {
+      if (!isParentWindow(e.source)) return;
       if (d.frameKey === FRAME_KEY) handleAction(d.msg);
       else childWindows().forEach(function (w) { try { w.postMessage(d, '*'); } catch (err) {} });
     }
@@ -735,6 +802,19 @@
   try {
     chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
       if (!msg || !msg.type) return;
+      if (msg.type === 'OS_PING') {
+        sendResponse({ ok: true, os: isOpenSubtitles(), url: location.href, ready: document.readyState });
+        return true;
+      }
+      if (msg.type === 'OS_SHOWS' || msg.type === 'OS_COLLECT' || msg.type === 'OS_FETCH') {
+        if (!isOpenSubtitles() || window.top !== window) return; // отвечает только страница сайта
+        if (msg.type === 'OS_SHOWS') { sendResponse(osShows()); return true; }
+        var work = msg.type === 'OS_COLLECT' ? osCollect() : osFetchSubtitle();
+        work.then(sendResponse, function (e) {
+          sendResponse({ ok: false, error: String((e && e.message) || e) });
+        });
+        return true;
+      }
       if (msg.type === 'PING') {
         gather(function (list) {
           sendResponse({ ok: true, href: location.href, frames: list });
@@ -756,8 +836,96 @@
     });
   } catch (e) {}
 
+  // ---------------- opensubtitles.com: чтение страницы поиска ----------------
+
+  // Работает только на самом сайте: расширение открывает нужную страницу
+  // в фоновой вкладке, а разбор идёт здесь, уже в браузере пользователя.
+
+  function isOpenSubtitles() {
+    return /(^|\.)opensubtitles\.com$/.test(location.hostname);
+  }
+
+  function sleep(ms) {
+    return new Promise(function (r) { setTimeout(r, ms); });
+  }
+
+  async function osCollect() {
+    var res = await OpenSubs.collectPages(document, { sleep: sleep });
+    return {
+      ok: true,
+      url: location.href,
+      total: res.total,
+      rows: res.rows,
+      languages: res.languages.map(function (g) {
+        return {
+          code: g.code, name: g.name, label: g.label, count: g.count,
+          downloads: g.downloads,
+          best: g.best ? { url: g.best.url, release: g.best.release, downloads: g.best.downloads } : null
+        };
+      })
+    };
+  }
+
+  function osShows() {
+    return {
+      ok: true,
+      url: location.href,
+      showId: OpenSubs.extractShowId(document),
+      shows: OpenSubs.parseShows(document).slice(0, 20)
+    };
+  }
+
+  // Ссылка на файл появляется после нажатия кнопки DOWNLOAD — сайт сам
+  // подставляет её в разметку. Мы просто ждём её и читаем файл по ней.
+  async function osFetchSubtitle() {
+    function fileLink() {
+      var links = document.querySelectorAll('a[download]');
+      for (var i = 0; i < links.length; i++) {
+        var href = links[i].getAttribute('href') || '';
+        if (!href || href === '#') continue;
+        return links[i];
+      }
+      return null;
+    }
+
+    var link = fileLink();
+    if (!link) {
+      var trigger = document.querySelector('a.download-trigger, .download-trigger');
+      if (trigger) trigger.click();
+      for (var i = 0; i < 40 && !link; i++) {
+        await sleep(250);
+        link = fileLink();
+      }
+    }
+    if (!link) {
+      return { ok: false, error: 'Кнопка скачивания на странице не найдена — возможно, нужен вход на сайт.' };
+    }
+
+    var name = link.getAttribute('download') || 'subtitles.srt';
+    var href = link.getAttribute('href');
+    try {
+      var res = await fetch(href, { credentials: 'include' });
+      if (!res.ok) return { ok: false, error: 'Сайт ответил ошибкой ' + res.status };
+      var buf = await res.arrayBuffer();
+      var kind = OpenSubs.sniffPayload(buf);
+      if (kind === 'zip' || kind === 'rar') {
+        return { ok: false, error: 'Субтитры отдаются архивом (' + kind + ') — распакуйте и загрузите файл вручную.', url: location.href };
+      }
+      if (kind === 'html') {
+        return { ok: false, error: 'Вместо файла пришла страница сайта: скорее всего исчерпан дневной лимит скачиваний или нужен вход.', url: location.href };
+      }
+      var dec = SubParse.decodeBytes(buf);
+      var parsed = SubParse.parse(dec.text, name);
+      if (!parsed.cues.length) return { ok: false, error: 'Файл скачался, но реплики в нём не распознаны.' };
+      return { ok: true, name: name, text: dec.text, encoding: dec.encoding, count: parsed.cues.length };
+    } catch (e) {
+      return { ok: false, error: 'Не удалось скачать файл: ' + (e && e.message ? e.message : e) };
+    }
+  }
+
   // первичный поиск
   refreshVideos();
+  ensureDiscoveryPoll();
   setTimeout(refreshVideos, 1000);
   setTimeout(refreshVideos, 3000);
 

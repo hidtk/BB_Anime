@@ -105,11 +105,14 @@
 
   // ---------- SRT ----------
 
-  var SRT_TIME = /(\d{1,3}):(\d{1,2}):(\d{1,2})[,.](\d{1,3})\s*-->\s*(\d{1,3}):(\d{1,2}):(\d{1,2})[,.](\d{1,3})/;
+  // миллисекунды не обязательны: встречаются файлы вида 00:00:01 --> 00:00:03
+  var SRT_TIME = /(\d{1,3}):(\d{1,2}):(\d{1,2})(?:[,.](\d{1,3}))?\s*-->\s*(\d{1,3}):(\d{1,2}):(\d{1,2})(?:[,.](\d{1,3}))?/;
 
   function hmsToSeconds(h, m, s, frac) {
-    var digits = String(frac).length;
-    var f = parseInt(frac, 10) / Math.pow(10, digits);
+    var f = 0;
+    if (frac !== undefined && frac !== null && frac !== '') {
+      f = parseInt(frac, 10) / Math.pow(10, String(frac).length);
+    }
     return parseInt(h, 10) * 3600 + parseInt(m, 10) * 60 + parseInt(s, 10) + f;
   }
 
@@ -199,9 +202,14 @@
 
   // ---------- финализация ----------
 
+  var MIN_DURATION = 1.2; // сек: столько показываем реплику с нулевой/битой длительностью
+
   function finalize(cues) {
     cues = cues.filter(function (c) {
-      return isFinite(c.start) && isFinite(c.end) && c.end > c.start && c.html;
+      return isFinite(c.start) && isFinite(c.end) && c.start >= 0 && c.html;
+    }).map(function (c) {
+      if (c.end <= c.start) c.end = c.start + MIN_DURATION;
+      return c;
     });
     cues.sort(function (a, b) { return a.start - b.start || a.end - b.end; });
     var out = [];
@@ -214,6 +222,36 @@
       out.push(cues[i]);
     }
     return out;
+  }
+
+  // Активные реплики на момент времени t. Двоичный поиск по началу + добор
+  // назад, чтобы поймать перекрывающиеся реплики (частый случай в ASS).
+  function findActive(cues, t) {
+    if (!cues || !cues.length || !isFinite(t)) return [];
+    var lo = 0, hi = cues.length - 1, idx = -1;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      if (cues[mid].start <= t) { idx = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    if (idx === -1) return [];
+    var out = [];
+    var guard = 0;
+    for (var i = idx; i >= 0 && guard < 64; i--, guard++) {
+      var c = cues[i];
+      if (c.start <= t && c.end > t) out.unshift(c);
+      else if (c.end <= t - 30) break; // дальше назад точно ничего активного нет
+    }
+    return out;
+  }
+
+  function activeHtml(cues, t) {
+    var list = findActive(cues, t);
+    if (!list.length) return '';
+    var parts = [];
+    for (var i = 0; i < list.length; i++) {
+      if (parts.indexOf(list[i].html) === -1) parts.push(list[i].html);
+    }
+    return parts.join('<br>');
   }
 
   function detectFormat(name, text) {
@@ -242,6 +280,8 @@
     parseSRT: parseSRT,
     parseASS: parseASS,
     detectFormat: detectFormat,
+    findActive: findActive,
+    activeHtml: activeHtml,
     srtTextToHtml: srtTextToHtml,
     assTextToHtml: assTextToHtml
   };
