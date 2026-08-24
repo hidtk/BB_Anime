@@ -3,7 +3,8 @@ const crypto = require('crypto');
 const path = require('path');
 const fsmod = require('fs');
 
-const EXT = '/home/claude/work/subtitler';
+const EXT = path.join(__dirname, '..', 'extension');
+const FIX = (name) => path.join(__dirname, name);
 const BASE = 'http://127.0.0.1:8123';
 const results = [];
 function check(name, ok, info) {
@@ -69,8 +70,21 @@ async function overlayText(page) {
   const status1 = await popup.textContent('#status');
   check('Попап видит видео на странице', /Найдено видео/.test(status1 || ''), status1);
 
+  // ---- панель поиска на opensubtitles.com в попапе ----
+  await popup.click('#osToggle');
+  await sleep(300);
+  const osPanelOpen = await popup.evaluate(() => !document.getElementById('osPanel').classList.contains('hidden'));
+  check('Попап: панель поиска субтитров разворачивается', osPanelOpen);
+  await popup.click('#osSearch');
+  await sleep(400);
+  const osValidation = await popup.textContent('#osStatus');
+  check('Попап: поиск без названия просит ввести название',
+    /Введите название/.test(osValidation || ''), osValidation);
+  await popup.click('#osToggle');
+  await sleep(200);
+
   // ---- SRT через попап (реальный путь пользователя) ----
-  await popup.setInputFiles('#fileInput', '/home/claude/work/test/test.srt');
+  await popup.setInputFiles('#fileInput', FIX('test.srt'));
   await sleep(900);
   const info = await popup.textContent('#fileInfo');
   check('SRT загружен через попап', /6 реплик/.test(info || ''), info);
@@ -202,7 +216,7 @@ async function overlayText(page) {
       vw: document.querySelector('video').getBoundingClientRect().width
     };
   });
-  await page.screenshot({ path: '/home/claude/work/test/shot-fullscreen.png' });
+  await page.screenshot({ path: FIX('shot-fullscreen.png') });
   check('Фуллскрин: субтитры видны поверх видео',
     (fsInfo.topLayer || fsInfo.inside) && fsInfo.text === 'First line of the test.' && Math.abs(fsInfo.w - fsInfo.vw) < 2,
     JSON.stringify(fsInfo));
@@ -239,7 +253,7 @@ async function overlayText(page) {
              text: h.shadowRoot.querySelector('.text').textContent,
              fit: Math.abs(hr.width - vr.width) < 2 && Math.abs(hr.height - vr.height) < 2 };
   });
-  await page.screenshot({ path: '/home/claude/work/test/shot-fullscreen-box.png' });
+  await page.screenshot({ path: FIX('shot-fullscreen-box.png') });
   check('Фуллскрин контейнера плеера: субтитры на месте',
     (fsBox.open || fsBox.inside) && fsBox.fit && fsBox.text === 'First line of the test.', JSON.stringify(fsBox));
   await page.evaluate(() => document.exitFullscreen && document.exitFullscreen());
@@ -247,7 +261,7 @@ async function overlayText(page) {
 
   // ---- ASS ----
   await popup.bringToFront();
-  await popup.setInputFiles('#fileInput', '/home/claude/work/test/test.ass');
+  await popup.setInputFiles('#fileInput', FIX('test.ass'));
   await sleep(900);
   const assInfo = await popup.textContent('#fileInfo');
   check('ASS загружен', /ASS/.test(assInfo || ''), assInfo);
@@ -271,7 +285,7 @@ async function overlayText(page) {
 
   // ---- windows-1251 ----
   await popup.bringToFront();
-  await popup.setInputFiles('#fileInput', '/home/claude/work/test/test-1251.srt');
+  await popup.setInputFiles('#fileInput', FIX('test-1251.srt'));
   await sleep(900);
   const encInfo = await popup.textContent('#fileInfo');
   await page.bringToFront();
@@ -286,7 +300,7 @@ async function overlayText(page) {
 
   // BOM
   await popup.bringToFront();
-  await popup.setInputFiles('#fileInput', '/home/claude/work/test/test-bom.srt');
+  await popup.setInputFiles('#fileInput', FIX('test-bom.srt'));
   await sleep(800);
   const bomInfo = await popup.textContent('#fileInfo');
   check('UTF-8 с BOM распознан', /BOM/.test(bomInfo || ''), bomInfo);
@@ -439,7 +453,7 @@ async function overlayText(page) {
   const fStatus = await fpopup.textContent('#status');
   check('Попап находит видео во вложенном фрейме', /Найдено видео: 1/.test(fStatus || '') && /во фрейме/.test(fStatus || ''), fStatus);
 
-  await fpopup.setInputFiles('#fileInput', '/home/claude/work/test/test.srt');
+  await fpopup.setInputFiles('#fileInput', FIX('test.srt'));
   await sleep(1400);
   const fInfo = await fpopup.textContent('#fileInfo');
   check('Субтитры загружаются в фрейм через попап', /6 реплик/.test(fInfo || ''), fInfo);
@@ -472,10 +486,52 @@ async function overlayText(page) {
   check('Горячая клавиша из верхнего документа доходит до фрейма', /\+0,50/.test(fShift || ''), fShift);
   check('Нет ошибок на странице с фреймом', fErrors.length === 0, fErrors.join(' | '));
 
+  // ---- разбор таблицы результатов opensubtitles.com ----
+  const osPage = await ctx.newPage();
+  const osErrors = [];
+  osPage.on('pageerror', e => osErrors.push(e.message));
+  await osPage.goto(BASE + '/os-fixture.html');
+  await osPage.addScriptTag({ path: path.join(__dirname, '..', 'extension', 'src', 'opensubs.js') });
+  const osFirstPage = await osPage.evaluate(() => ({
+    rows: OpenSubs.parseResults(document).map(r => r.code + ':' + r.downloads),
+    total: OpenSubs.totalEntries(document),
+    hasNext: !!OpenSubs.nextPageButton(document)
+  }));
+  check('OpenSubtitles: строки первой страницы разобраны',
+    osFirstPage.rows, ['en:306', 'ru:58', 'ja:12']);
+  check('OpenSubtitles: общее число результатов прочитано', osFirstPage.total, 5);
+  check('OpenSubtitles: кнопка следующей страницы найдена', osFirstPage.hasNext, true);
+
+  const osAll = await osPage.evaluate(async () => {
+    const res = await OpenSubs.collectPages(document, { sleep: ms => new Promise(r => setTimeout(r, ms)) });
+    return {
+      count: res.rows.length,
+      total: res.total,
+      languages: res.languages.map(l => l.label + ':' + l.count),
+      bestRu: (res.languages.find(l => l.code === 'ru') || {}).best
+    };
+  });
+  check('OpenSubtitles: собраны обе страницы результатов', osAll.count, 5);
+  check('OpenSubtitles: языки сгруппированы и отсортированы',
+    osAll.languages, ['русский:2', 'английский:1', '日本語:1', 'Deutsch:1']);
+  check('OpenSubtitles: лучший вариант языка — самый скачиваемый',
+    osAll.bestRu && osAll.bestRu.url.endsWith('/en/subtitles/frieren-s01e05-russian-alt'), true);
+  const osRelease = await osPage.evaluate(() => OpenSubs.parseResults(document)[0].release);
+  check('OpenSubtitles: имя релиза не дублируется мобильной версией строки',
+    osRelease, 'Frieren.S01E05.1080p.WEB');
+
+  check('OpenSubtitles: ссылки достроены до абсолютных',
+    osAll.bestRu && osAll.bestRu.url.startsWith('https://www.opensubtitles.com/'), true);
+
+  const osPassive = await osPage.evaluate(() => document.querySelectorAll('[data-sub-overlay]').length);
+  check('OpenSubtitles: на странице без видео оверлей не рисуется',
+    osPassive === 0 && osErrors.length === 0, JSON.stringify(osErrors));
+  await osPage.close();
+
   check('Нет ошибок в консоли страницы', realErrors.length === 0, realErrors.join(' | ') || ('всего сообщений: ' + errors.length));
   check('Нет ошибок в попапе', popupErrors.length === 0, popupErrors.join(' | '));
 
-  fsmod.writeFileSync('/home/claude/work/test/results.json', JSON.stringify(results, null, 2));
+  fsmod.writeFileSync(FIX('results.json'), JSON.stringify(results, null, 2));
   const failed = results.filter(r => !r.ok);
   console.log('\n' + (results.length - failed.length) + '/' + results.length + ' проверок пройдено');
   await ctx.close();

@@ -1,0 +1,51 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<title>Фикстура: таблица результатов opensubtitles.com</title></head>
+<body>
+<!-- Разметка повторяет структуру реальной таблицы результатов сайта:
+     в первой ячейке ссылка с кодом языка в скрытом span, флагом и
+     человеческим названием в data-original-title. -->
+<table id="results">
+  <thead><tr><th></th><th>Release name</th><th>Upload date</th><th>Uploader</th><th></th><th></th></tr></thead>
+  <tbody id="tb"></tbody>
+</table>
+<div id="results_info">Showing 1 to 3 of 5 entries</div>
+<ul class="pagination">
+  <li><a href="#" id="prev">Previous</a></li>
+  <li><a href="#" id="next">Next</a></li>
+</ul>
+<script>
+const PAGES = [
+  [
+    ['en', 'English', 'frieren-s01e05-english', 'Frieren.S01E05.1080p.WEB', '2026-01-02', 'uploader1', '306'],
+    ['ru', 'русский язык', 'frieren-s01e05-russian', 'Frieren.S01E05.1080p.WEB.rus', '2026-01-03', 'uploader2', '58'],
+    ['ja', '日本語', 'frieren-s01e05-japanese', 'Frieren.S01E05.JP', '2026-01-04', 'uploader3', '12']
+  ],
+  [
+    ['ru', 'русский язык', 'frieren-s01e05-russian-alt', 'Frieren.S01E05.BDRip.rus', '2026-01-05', 'uploader4', '141'],
+    ['de', 'Deutsch', 'frieren-s01e05-german', 'Frieren.S01E05.German', '2026-01-06', 'uploader5', '9']
+  ]
+];
+let page = 0;
+function render() {
+  const tb = document.getElementById('tb');
+  tb.innerHTML = PAGES[page].map(r => `
+    <tr>
+      <td><a data-toggle="tooltip" href="/en/subtitles/${r[2]}" data-original-title="${r[1]}"><span style="display:none">${r[0]}</span><i class="flag ${r[0]}"></i></a></td>
+      <td><a href="/en/subtitles/${r[2]}"><span class="block md:hidden">${r[3].replace(/\./g, '. ')}</span><span class="hidden md:block">${r[3]}</span></a><em>${r[3]}</em></td>
+      <td>${r[4]}</td>
+      <td>${r[5]}</td>
+      <td>100%</td>
+      <td>${r[6]}</td>
+    </tr>`).join('');
+  const from = page === 0 ? 1 : 4;
+  const to = page === 0 ? 3 : 5;
+  document.getElementById('results_info').textContent = `Showing ${from} to ${to} of 5 entries`;
+  document.getElementById('next').parentNode.className = page >= PAGES.length - 1 ? 'disabled' : '';
+}
+document.getElementById('next').addEventListener('click', e => {
+  e.preventDefault();
+  if (page < PAGES.length - 1) { page++; render(); }
+});
+render();
+</script>
+</body></html>

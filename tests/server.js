@@ -1,5 +1,5 @@
 const http=require('http'), fs=require('fs'), path=require('path');
-const ROOT='/home/claude/work/test';
+const ROOT=__dirname;
 const MIME={'.html':'text/html; charset=utf-8','.webm':'video/webm','.mp4':'video/mp4','.srt':'text/plain','.ass':'text/plain','.js':'text/javascript'};
 http.createServer((req,res)=>{
   const p=path.join(ROOT, decodeURIComponent(req.url.split('?')[0]));
