@@ -1,0 +1,65 @@
+name: Тесты
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    name: Юнит-тесты (парсер, кодировки, выбор реплики)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Прогон
+        run: node tests/unit.js
+
+  e2e:
+    name: Сквозные тесты в Chromium
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Системные зависимости
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg xvfb
+
+      - name: Playwright и Chromium
+        run: |
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund playwright
+          npx playwright install --with-deps chromium
+
+      - name: Тестовый ролик
+        working-directory: tests
+        run: sh make-video.sh
+
+      - name: Локальный сервер
+        working-directory: tests
+        run: |
+          node server.js &
+          for i in $(seq 1 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8123/page.html && break
+            sleep 0.5
+          done
+
+      - name: Прогон
+        run: xvfb-run -a --server-args="-screen 0 1280x900x24" node tests/run.js
+
+      - name: Артефакты прогона
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: результаты-e2e
+          path: |
+            tests/results.json
+            tests/shot-*.png
+          if-no-files-found: ignore
