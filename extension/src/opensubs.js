@@ -252,6 +252,75 @@
     return 'subtitle';
   }
 
+  // ---- что именно сейчас смотрят: название, сезон, серия ----
+
+  var JUNK_TITLE = /(watch|online|free|hd|sub\s*&?\s*dub|смотреть|онлайн|бесплатно)/gi;
+
+  function cleanTitle(raw) {
+    var t = String(raw || '');
+    t = t.split(/\s+[—–|·]\s+/)[0];
+    t = t.replace(/\(\d{4}\)/g, ' ');
+    t = t.replace(/[sS]\d{1,2}[\s._-]?[eE]\d{1,3}/g, ' ');
+    t = t.replace(/\b(episode|серия|эпизод)\s*\d{1,3}\b/gi, ' ');
+    // технические хвосты вроде «1080p WEB-DL x265»
+    t = t.replace(/\b\d{3,4}[pi]\b/gi, ' ');
+    t = t.replace(/\b(web-?dl|webrip|bd-?rip|bluray|hdtv|x26[45]|hevc|aac|flac|dual audio|multi-?subs?|dub|sub)\b/gi, ' ');
+    t = t.replace(JUNK_TITLE, ' ');
+    t = t.replace(/[_.]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
+    t = t.replace(/[:\-–—]+$/, '').trim();
+    return t;
+  }
+
+  // url и заголовок обязательны, doc — если есть доступ к странице (так точнее)
+  function detectEpisode(url, title, doc) {
+    var res = { title: '', season: null, episode: null, from: '' };
+    var hay = String(url || '') + ' \n ' + String(title || '');
+    var m = /[sS](\d{1,2})[\s._-]?[eE](\d{1,3})/.exec(hay);
+    if (m) { res.season = parseInt(m[1], 10); res.episode = parseInt(m[2], 10); res.from = 'S..E..'; }
+
+    if (res.episode === null) {
+      m = /season[-_/ ]?(\d{1,2})[^\d]{0,12}episode[-_/ ]?(\d{1,3})/i.exec(hay);
+      if (m) { res.season = parseInt(m[1], 10); res.episode = parseInt(m[2], 10); res.from = 'season/episode'; }
+    }
+    if (res.episode === null) {
+      m = /(?:episode|серия|эпизод)[-_/ ]?(\d{1,3})/i.exec(hay);
+      if (m) { res.episode = parseInt(m[1], 10); res.from = 'episode N'; }
+    }
+    if (res.episode === null) {
+      m = /[?&](?:ep|episode)=(\d{1,3})\b/i.exec(hay);
+      if (m) { res.episode = parseInt(m[1], 10); res.from = 'параметр в ссылке'; }
+    }
+
+    if (doc) {
+      if (res.episode === null) {
+        var nodes = doc.querySelectorAll('button, a, li');
+        for (var i = 0; i < nodes.length; i++) {
+          var el = nodes[i];
+          var txt = (el.textContent || '').trim();
+          if (!/^\d{1,3}$/.test(txt)) continue;
+          var cls = (el.className || '') + ' ' + (el.getAttribute('aria-current') || '') +
+            ' ' + (el.getAttribute('data-state') || '');
+          if (/active|current|selected|bg-primary|bg-orange|is-active/i.test(cls)) {
+            res.episode = parseInt(txt, 10);
+            res.from = 'выбранная серия на странице';
+            break;
+          }
+        }
+      }
+      var og = doc.querySelector('meta[property="og:title"], meta[name="title"]');
+      var h1 = doc.querySelector('h1');
+      res.title = cleanTitle((og && og.getAttribute('content')) || (h1 && h1.textContent) || '');
+    }
+
+    if (!res.title) res.title = cleanTitle(title);
+    if (!res.title && url) {
+      var slug = /\/(?:anime|tv|series|title|watch)\/([a-z0-9-]+)/i.exec(String(url));
+      if (slug) res.title = cleanTitle(slug[1].replace(/-\d+$/, '').replace(/-/g, ' '));
+    }
+    if (res.episode !== null && res.season === null) res.season = 1;
+    return res;
+  }
+
   var API = {
     ORIGIN: ORIGIN,
     LANG_RU: LANG_RU,
@@ -267,6 +336,8 @@
     collectPages: collectPages,
     dedupe: dedupe,
     sniffPayload: sniffPayload,
+    detectEpisode: detectEpisode,
+    cleanTitle: cleanTitle,
     absolute: absolute
   };
 

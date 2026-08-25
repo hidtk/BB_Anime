@@ -5,7 +5,7 @@
 
   var DEFAULTS = {
     fontSizePct: 4.5, bottomPct: 10, bgOpacity: 0.45,
-    color: '#ffffff', outline: true, rememberPerSite: true
+    color: '#ffffff', outline: true, rememberPerSite: true, preferLang: 'en'
   };
 
   var el = {
@@ -28,8 +28,30 @@
     bgOpacity: document.getElementById('bgOpacity'),
     bgOpacityVal: document.getElementById('bgOpacityVal'),
     outline: document.getElementById('outline'),
-    remember: document.getElementById('remember')
+    remember: document.getElementById('remember'),
+    reloadExt: document.getElementById('reloadExt'),
+    verLine: document.getElementById('verLine')
   };
+
+  function extVersion() {
+    try { return chrome.runtime.getManifest().version || '?'; } catch (e) { return '?'; }
+  }
+
+  // Расширение, поставленное «распакованной папкой», Chrome перезапускает только
+  // вручную. Пока этого не сделали, в страницы инжектится прежний код — попап
+  // при этом уже новый, потому что читается с диска. Чиним одной кнопкой.
+  function offerReload(pageVersion) {
+    el.reloadExt.classList.remove('hidden');
+    el.reloadExt.onclick = function () {
+      el.reloadExt.disabled = true;
+      el.reloadExt.textContent = 'Перезагружаю…';
+      try { chrome.runtime.reload(); } catch (e) {
+        el.status.textContent = 'Не вышло — перезагрузите расширение на chrome://extensions';
+      }
+    };
+    el.diag.textContent = 'В страницах работает версия ' + (pageVersion || 'до 1.1') +
+      ', а на диске уже ' + extVersion() + '. Нажмите кнопку выше, затем обновите вкладку с видео клавишей F5.';
+  }
 
   var tabId = null;
   var target = null;      // {frameKey: string, videoId: number}
@@ -178,9 +200,9 @@
     // Так бывает, когда расширение обновили, а вкладку не перезагрузили —
     // Chrome оставляет в открытых вкладках прежний код.
     if (!res.frames) {
-      el.status.textContent = 'Вкладка работает на старой версии расширения.';
+      el.status.textContent = 'В этой вкладке работает старая версия расширения.';
       el.status.className = 'status warn';
-      el.diag.textContent = 'Нажмите F5 на вкладке с видео: Chrome подхватывает обновление расширения только при перезагрузке страницы.';
+      offerReload(null);
       el.videoSection.classList.add('hidden');
       el.shiftSection.classList.add('hidden');
       el.fileInfo.classList.add('hidden');
@@ -191,6 +213,23 @@
 
     el.pickBtn.disabled = false;
     var view = flatten(res);
+
+    // версия кода на странице против версии на диске
+    var stale = view.frames.filter(function (f) {
+      return f.version && f.version !== extVersion();
+    })[0];
+    if (stale) {
+      el.status.textContent = 'В этой вкладке работает старая версия расширения.';
+      el.status.className = 'status warn';
+      offerReload(stale.version);
+      el.videoSection.classList.add('hidden');
+      el.shiftSection.classList.add('hidden');
+      el.fileInfo.classList.add('hidden');
+      el.clearBtn.classList.add('hidden');
+      el.pickBtn.disabled = true;
+      return;
+    }
+    el.reloadExt.classList.add('hidden');
     pickTarget(view);
     var frame = frameOf(view);
     var sub = frame && frame.sub ? frame.sub : null;
@@ -264,6 +303,7 @@
     el.bgOpacityVal.textContent = Math.round(s.bgOpacity * 100) + ' %';
     el.outline.checked = !!s.outline;
     el.remember.checked = !!s.rememberPerSite;
+    if (s.preferLang) os.lang.value = s.preferLang;
   }
 
   function saveSettings(patch) {
@@ -346,6 +386,8 @@
     season: document.getElementById('osSeason'),
     episode: document.getElementById('osEpisode'),
     search: document.getElementById('osSearch'),
+    auto: document.getElementById('osAuto'),
+    lang: document.getElementById('osLang'),
     showRow: document.getElementById('osShowRow'),
     show: document.getElementById('osShow'),
     status: document.getElementById('osStatus'),
@@ -473,8 +515,10 @@
 
     osBusy = true;
     os.search.disabled = true;
+    os.auto.disabled = true;
     os.results.innerHTML = '';
     var tab = null;
+    var found = null;
     try {
       osSay('Открываю поиск на opensubtitles.com…');
       tab = await tabsCreate(OpenSubs.buildTitleSearchUrl(q));
@@ -513,13 +557,52 @@
       renderLanguages(data);
       var total = data.total ? data.total : data.rows.length;
       osSay('Найдено вариантов: ' + total + ', языков: ' + data.languages.length + '.');
+      found = data;
     } catch (e) {
       osSay((e && e.message) || String(e), 'warn');
     } finally {
       if (tab) { await tabsRemove(tab.id); rememberTempTab(null); }
       os.search.disabled = false;
+      os.auto.disabled = false;
       osBusy = false;
     }
+    return found;
+  }
+
+  // Полный автомат: сама страница подсказывает сериал и серию, дальше
+  // остаётся выбрать язык и скачать лучший по числу скачиваний вариант.
+  async function osAutoRun() {
+    if (osBusy) return;
+    if (!target) { osSay('Сначала откройте вкладку с видео.', 'warn'); return; }
+    osSay('Смотрю, что сейчас на экране…');
+    var ctx = await send({ type: 'OS_CONTEXT' });
+    if (!ctx || !ctx.title) {
+      osSay('Не удалось понять, что за серия. Введите название и номер серии вручную.', 'warn');
+      return;
+    }
+    os.query.value = ctx.title;
+    if (ctx.season) os.season.value = ctx.season;
+    if (ctx.episode) os.episode.value = ctx.episode;
+    if (!ctx.episode) {
+      osSay('Нашёл «' + ctx.title + '», но номер серии со страницы не читается — впишите его сам' +
+        'и нажмите «Авто» ещё раз.', 'warn');
+      return;
+    }
+
+    var data = await osRun();
+    if (!data || !data.languages || !data.languages.length) return;
+
+    var want = os.lang.value;
+    var pick = data.languages.filter(function (l) { return l.code === want; })[0] ||
+      data.languages.filter(function (l) { return String(l.code).split('-')[0] === want; })[0];
+    if (!pick) {
+      osSay('Субтитры есть, но не на «' + want + '». Выберите язык из списка ниже.', 'warn');
+      return;
+    }
+    if (!pick.best) { osSay('Для этого языка не нашлось ссылки на файл.', 'warn'); return; }
+
+    var fake = { textContent: '', disabled: false };
+    await osTake(pick.best.url, fake);
   }
 
   async function osTake(subtitleUrl, btn) {
@@ -555,7 +638,9 @@
     os.panel.classList.toggle('hidden');
     if (!os.panel.classList.contains('hidden')) os.query.focus();
   });
-  os.search.addEventListener('click', osRun);
+  os.search.addEventListener('click', function () { osRun(); });
+  os.auto.addEventListener('click', osAutoRun);
+  os.lang.addEventListener('change', function () { saveSettings({ preferLang: this.value }); });
   [os.query, os.season, os.episode].forEach(function (el) {
     el.addEventListener('keydown', function (e) { if (e.key === 'Enter') osRun(); });
   });
@@ -564,6 +649,7 @@
 
   (async function init() {
     chrome.storage.sync.get(DEFAULTS, function (s) { applySettingsUI(Object.assign({}, DEFAULTS, s || {})); });
+    el.verLine.textContent = 'версия ' + extVersion();
     cleanupTempTab();
     var found = await resolveTab();
     if (found.id == null) {

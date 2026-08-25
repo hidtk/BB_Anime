@@ -700,10 +700,15 @@
     });
   }
 
+  function extVersion() {
+    try { return chrome.runtime.getManifest().version || ''; } catch (e) { return ''; }
+  }
+
   function localInfo() {
     refreshVideos();
     return {
       frameKey: FRAME_KEY,
+      version: extVersion(),
       url: location.href.slice(0, 150),
       isTop: window.top === window,
       videos: videoList(),
@@ -802,6 +807,12 @@
   try {
     chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
       if (!msg || !msg.type) return;
+      if (msg.type === 'OS_CONTEXT') {
+        if (window.top !== window) return; // отвечает только верхний фрейм
+        sendResponse(Object.assign({ ok: true },
+          OpenSubs.detectEpisode(location.href, document.title, document)));
+        return true;
+      }
       if (msg.type === 'OS_PING') {
         sendResponse({ ok: true, os: isOpenSubtitles(), url: location.href, ready: document.readyState });
         return true;
@@ -908,8 +919,18 @@
       if (!res.ok) return { ok: false, error: 'Сайт ответил ошибкой ' + res.status };
       var buf = await res.arrayBuffer();
       var kind = OpenSubs.sniffPayload(buf);
-      if (kind === 'zip' || kind === 'rar') {
-        return { ok: false, error: 'Субтитры отдаются архивом (' + kind + ') — распакуйте и загрузите файл вручную.', url: location.href };
+      if (kind === 'zip') {
+        // архивы распаковываем сами
+        var unpacked = null;
+        try { unpacked = await SubZip.extractSubtitle(buf); } catch (e) { unpacked = null; }
+        if (!unpacked) {
+          return { ok: false, error: 'Внутри архива не нашлось файла субтитров.', url: location.href };
+        }
+        name = unpacked.name || name;
+        buf = unpacked.bytes.buffer.slice(unpacked.bytes.byteOffset,
+          unpacked.bytes.byteOffset + unpacked.bytes.byteLength);
+      } else if (kind === 'rar') {
+        return { ok: false, error: 'Субтитры лежат в rar — такой архив расширение не открывает, скачайте вручную.', url: location.href };
       }
       if (kind === 'html') {
         return { ok: false, error: 'Вместо файла пришла страница сайта: скорее всего исчерпан дневной лимит скачиваний или нужен вход.', url: location.href };

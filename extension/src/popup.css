@@ -53,3 +53,6 @@ input.num { width: 80px; }
 .osrow button { padding: 4px 8px; font-size: 11px; }
 .osrow a { color: #7ea2ff; font-size: 11px; text-decoration: none; white-space: nowrap; }
 .osempty { color: #83879a; font-size: 12px; }
+
+#reloadExt { margin-top: 8px; text-align: center; }
+.ver { margin-top: 10px; font-size: 10px; color: #5f6470; text-align: right; }

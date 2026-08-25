@@ -10,6 +10,7 @@
     <h1>Субтитры поверх видео</h1>
     <div id="status" class="status">Проверяю страницу…</div>
     <div id="diag" class="diag"></div>
+    <button id="reloadExt" class="ghost wide hidden">↻ Перезагрузить расширение</button>
   </header>
 
   <section id="videoSection" class="block hidden">
@@ -49,7 +50,17 @@
       <div class="row">
         <input id="osSeason" type="number" min="1" max="99" placeholder="Сезон" class="num">
         <input id="osEpisode" type="number" min="1" max="999" placeholder="Серия" class="num">
-        <button id="osSearch" class="primary sm grow">Найти языки</button>
+        <select id="osLang" class="num" title="Какой язык брать автоматически">
+          <option value="en">EN</option>
+          <option value="ru">RU</option>
+          <option value="ja">JA</option>
+          <option value="es">ES</option>
+          <option value="de">DE</option>
+        </select>
+      </div>
+      <div class="row">
+        <button id="osAuto" class="primary sm grow">⚡ Авто: найти и включить</button>
+        <button id="osSearch" class="sm">Языки</button>
       </div>
       <label id="osShowRow" class="lbl hidden" for="osShow">Что именно ищем</label>
       <select id="osShow" class="hidden"></select>
@@ -74,7 +85,10 @@
     </div>
   </section>
 
+  <div id="verLine" class="ver"></div>
+
   <script src="subparse.js"></script>
+  <script src="subzip.js"></script>
   <script src="opensubs.js"></script>
   <script src="popup.js"></script>
 </body>
