@@ -511,7 +511,26 @@
     });
   }
 
-  function isNetworkError(e) {
+  // Прямые запросы из попапа сайт часто отбивает кодом 403 (защита от
+  // ботов не любит заголовок chrome-extension://). Признак запоминаем,
+  // чтобы в следующий раз сразу идти через вкладку и не терять время.
+  var osDirectBlocked = false;
+
+  try {
+    chrome.storage.local.get('osDirectBlocked', function (r) {
+      if (chrome.runtime.lastError) return;
+      osDirectBlocked = !!(r && r.osDirectBlocked);
+    });
+  } catch (e) {}
+
+  function markDirectBlocked() {
+    if (osDirectBlocked) return;
+    osDirectBlocked = true;
+    try { chrome.storage.local.set({ osDirectBlocked: true }, function () { void chrome.runtime.lastError; }); } catch (e) {}
+  }
+
+  function needsFallback(e) {
+    if (e && e.transportFailed) return true;
     var m = String((e && e.message) || e || '');
     return (e instanceof TypeError) || /failed to fetch|networkerror|load failed/i.test(m);
   }
@@ -576,19 +595,23 @@
     }
 
     try {
-      try {
-        var data = await attempt();
-        show(data);
-        found = data;
-      } catch (e) {
-        if (!isNetworkError(e)) throw e;
-        osSay('Прямой запрос не прошёл, открываю сайт в фоне…');
-        proxy = await openProxy();
-        if (!proxy) throw new Error('Не удалось открыть opensubtitles.com. Откройте сайт вручную один раз (принять cookie) и попробуйте снова.');
-        var data2 = await attempt();
-        show(data2);
-        found = data2;
+      var data = null;
+      if (!osDirectBlocked) {
+        try {
+          data = await attempt();
+        } catch (e) {
+          if (!needsFallback(e)) throw e;
+          markDirectBlocked();
+        }
       }
+      if (!data) {
+        osSay('Открываю opensubtitles.com в фоне…');
+        proxy = await openProxy();
+        if (!proxy) throw new Error('Не удалось открыть opensubtitles.com. Откройте сайт вручную один раз и попробуйте снова.');
+        data = await attempt();
+      }
+      show(data);
+      found = data;
     } catch (e) {
       if (e && e.shows && e.shows.length > 1) renderShows(e.shows);
       osSay((e && e.message) || String(e), 'warn');
@@ -649,18 +672,34 @@
     try {
       osSay('Скачиваю файл…');
       var res = null;
-      try {
-        res = await OsNet.download(subtitleUrl);
-      } catch (netErr) {
-        if (!isNetworkError(netErr)) throw netErr;
-        res = null;
+      var why = '';
+      var blocked = false;
+
+      async function tryDownload() {
+        try {
+          var r = await OsNet.download(subtitleUrl);
+          if (r && r.ok) return r;
+          // ответ пришёл, но это не субтитры (лимит, rar, страница сайта)
+          why = (r && r.error) || why;
+          return null;
+        } catch (e) {
+          if (!needsFallback(e)) throw e;
+          blocked = true;
+          why = e.message || why;
+          return null;
+        }
       }
-      if (!res || !res.ok) {
+
+      if (!osDirectBlocked) {
+        res = await tryDownload();
+        if (!res && blocked) markDirectBlocked();
+      }
+      if (!res) {
         // напрямую не вышло — идём через фоновую вкладку сайта
-        osSay('Пробую скачать через сайт…');
+        osSay('Скачиваю через сайт…');
         proxy = await openProxy();
         if (proxy) {
-          try { res = await OsNet.download(subtitleUrl); } catch (e2) { res = null; }
+          res = await tryDownload();
           await closeProxy(proxy);
           proxy = null;
         }
@@ -675,7 +714,7 @@
         if (viaTab && viaTab.ok) res = viaTab;
         else if (viaTab && viaTab.error) throw new Error(viaTab.error);
       }
-      if (!res || !res.ok) throw new Error((res && res.error) || 'Скачать не удалось.');
+      if (!res || !res.ok) throw new Error((res && res.error) || why || 'Скачать не удалось.');
       await action({ type: 'LOAD_TEXT', text: res.text, name: res.name, encoding: res.encoding });
       osSay('Загружено: ' + res.name + ' — ' + res.count + ' реплик.');
       setTimeout(async function () { apply(await ping()); }, 200);

@@ -24,10 +24,25 @@
 
   function setTransport(t) { transport = t || null; }
 
+  // Ошибка транспорта — это «сходить не получилось», а не «ничего не нашлось».
+  // Попап по этому признаку повторяет ту же работу через вкладку сайта.
+  function transportError(message) {
+    var e = new Error(message);
+    e.transportFailed = true;
+    return e;
+  }
+
   async function fetchText(url) {
     if (transport && transport.text) return await transport.text(url);
-    var res = await fetch(url, { credentials: 'include', redirect: 'follow' });
-    if (!res.ok) throw new Error('opensubtitles.com ответил ошибкой ' + res.status);
+    var res;
+    try {
+      res = await fetch(url, { credentials: 'include', redirect: 'follow' });
+    } catch (e) {
+      throw transportError('Запрос к opensubtitles.com не прошёл: ' + ((e && e.message) || e));
+    }
+    // 403 сайт отдаёт запросам от расширения (защита от ботов), 429 — при
+    // частых запросах: и то и другое лечится походом через вкладку сайта.
+    if (!res.ok) throw transportError('opensubtitles.com ответил ошибкой ' + res.status);
     return await res.text();
   }
 
@@ -42,11 +57,16 @@
   async function fetchBytes(url, fallbackName) {
     if (transport && transport.bytes) {
       var got = await transport.bytes(url);
-      if (!got || !got.ok) throw new Error((got && got.error) || 'Файл не скачался.');
+      if (!got || !got.ok) throw transportError((got && got.error) || 'Файл не скачался.');
       return { bytes: base64ToBytes(got.base64).buffer, name: got.name || fallbackName };
     }
-    var res = await fetch(url, { credentials: 'include', redirect: 'follow' });
-    if (!res.ok) throw new Error('Файл не отдался, сайт ответил ' + res.status + '.');
+    var res;
+    try {
+      res = await fetch(url, { credentials: 'include', redirect: 'follow' });
+    } catch (e) {
+      throw transportError('Файл не скачался: ' + ((e && e.message) || e));
+    }
+    if (!res.ok) throw transportError('Файл не отдался, сайт ответил ' + res.status + '.');
     return { bytes: await res.arrayBuffer(), name: nameFromHeaders(res, fallbackName) };
   }
 
@@ -280,6 +300,7 @@
   var API = {
     ORIGIN: ORIGIN,
     fetchDoc: fetchDoc,
+    transportError: transportError,
     fetchBytes: fetchBytes,
     setTransport: setTransport,
     parseDoc: parseDoc,
