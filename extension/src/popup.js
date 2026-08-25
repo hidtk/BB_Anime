@@ -445,6 +445,8 @@
   }
 
   function renderShows(list) {
+    var wasIdx = parseInt(os.show.value, 10);
+    var wasUrl = (osShows && osShows[wasIdx]) ? osShows[wasIdx].url : null;
     osShows = list;
     if (list.length < 2) { os.show.classList.add('hidden'); os.showRow.classList.add('hidden'); return; }
     os.show.innerHTML = '';
@@ -454,6 +456,9 @@
       o.textContent = (s.isSeries ? 'Сериал: ' : 'Фильм: ') + s.title;
       os.show.appendChild(o);
     });
+    if (wasUrl) {
+      for (var k = 0; k < list.length; k++) if (list[k].url === wasUrl) { os.show.value = String(k); break; }
+    }
     os.show.classList.remove('hidden');
     os.showRow.classList.remove('hidden');
   }
@@ -506,6 +511,41 @@
     });
   }
 
+  function isNetworkError(e) {
+    var m = String((e && e.message) || e || '');
+    return (e instanceof TypeError) || /failed to fetch|networkerror|load failed/i.test(m);
+  }
+
+  // Одна фоновая вкладка сайта на всю операцию: через неё идут запросы,
+  // если прямые из попапа не проходят.
+  async function openProxy() {
+    var tab = await tabsCreate(OpenSubs.ORIGIN + '/en');
+    rememberTempTab(tab.id);
+    if (!await waitTabReady(tab.id, 25000)) {
+      await tabsRemove(tab.id);
+      rememberTempTab(null);
+      return null;
+    }
+    OsNet.setTransport({
+      text: async function (url) {
+        var r = await sendTab(tab.id, { type: 'OS_DOC', url: url });
+        if (!r || !r.ok) throw new Error((r && r.error) || 'Страница не прочиталась.');
+        return r.html;
+      },
+      bytes: async function (url) {
+        return await sendTab(tab.id, { type: 'OS_BIN', url: url });
+      }
+    });
+    return tab;
+  }
+
+  async function closeProxy(tab) {
+    OsNet.setTransport(null);
+    if (tab) { await tabsRemove(tab.id); rememberTempTab(null); }
+  }
+
+  // Основной путь: обычные запросы к opensubtitles.com прямо отсюда.
+  // Страница поиска отдаёт сразу все строки таблицы, листать не нужно.
   async function osRun() {
     if (osBusy) return;
     var q = os.query.value.trim();
@@ -517,51 +557,43 @@
     os.search.disabled = true;
     os.auto.disabled = true;
     os.results.innerHTML = '';
-    var tab = null;
     var found = null;
-    try {
-      osSay('Открываю поиск на opensubtitles.com…');
-      tab = await tabsCreate(OpenSubs.buildTitleSearchUrl(q));
-      rememberTempTab(tab.id);
-      if (!await waitTabReady(tab.id, 25000)) {
-        throw new Error('Сайт не ответил. Откройте opensubtitles.com вручную один раз (принять cookie) и попробуйте снова.');
-      }
+    var proxy = null;
 
-      var url;
-      if (season && episode) {
-        var info = await sendTab(tab.id, { type: 'OS_SHOWS' });
-        var list = ((info && info.shows) || []);
-        var series = list.filter(function (s) { return s.isSeries; });
-        var pool = series.length ? series : list;
-        if (!pool.length) throw new Error('По этому названию на сайте ничего не нашлось.');
-        renderShows(pool);
-        var idx = parseInt(os.show.value, 10);
-        var chosen = pool[isFinite(idx) && pool[idx] ? idx : 0];
-
-        osSay('Открываю «' + chosen.title + '»…');
-        await tabsUpdate(tab.id, chosen.url);
-        if (!await waitTabReady(tab.id, 25000)) throw new Error('Страница сериала не открылась.');
-        var showInfo = await sendTab(tab.id, { type: 'OS_SHOWS' });
-        var showId = showInfo && showInfo.showId;
-        if (!showId) throw new Error('Не удалось определить сериал в базе сайта.');
-        url = OpenSubs.buildEpisodeSearchUrl(showId, season, episode);
-        osSay('Смотрю сезон ' + season + ', серию ' + episode + '…');
-        await tabsUpdate(tab.id, url);
-        if (!await waitTabReady(tab.id, 25000)) throw new Error('Страница результатов не открылась.');
-      } else {
-        osSay('Собираю языки по названию (сезон и серию можно указать для точности)…');
-      }
-
-      var data = await sendTab(tab.id, { type: 'OS_COLLECT' });
-      if (!data || !data.ok) throw new Error('Не удалось разобрать страницу результатов.');
+    function show(data) {
+      if (data.shows && data.shows.length > 1) renderShows(data.shows);
+      if (data.season) os.season.value = String(data.season);
       renderLanguages(data);
-      var total = data.total ? data.total : data.rows.length;
-      osSay('Найдено вариантов: ' + total + ', языков: ' + data.languages.length + '.');
-      found = data;
+      osSay('Найдено вариантов: ' + data.total + ', языков: ' + data.languages.length + '.');
+    }
+    function attempt() {
+      var idx = parseInt(os.show.value, 10);
+      var prefer = (!os.showRow.classList.contains('hidden') && osShows && osShows[idx]) ? osShows[idx] : null;
+      return OsNet.searchEpisode({
+        query: q, season: season, episode: episode, preferShow: prefer,
+        onStep: function (t) { osSay(t); }
+      });
+    }
+
+    try {
+      try {
+        var data = await attempt();
+        show(data);
+        found = data;
+      } catch (e) {
+        if (!isNetworkError(e)) throw e;
+        osSay('Прямой запрос не прошёл, открываю сайт в фоне…');
+        proxy = await openProxy();
+        if (!proxy) throw new Error('Не удалось открыть opensubtitles.com. Откройте сайт вручную один раз (принять cookie) и попробуйте снова.');
+        var data2 = await attempt();
+        show(data2);
+        found = data2;
+      }
     } catch (e) {
+      if (e && e.shows && e.shows.length > 1) renderShows(e.shows);
       osSay((e && e.message) || String(e), 'warn');
     } finally {
-      if (tab) { await tabsRemove(tab.id); rememberTempTab(null); }
+      await closeProxy(proxy);
       os.search.disabled = false;
       os.auto.disabled = false;
       osBusy = false;
@@ -569,8 +601,8 @@
     return found;
   }
 
-  // Полный автомат: сама страница подсказывает сериал и серию, дальше
-  // остаётся выбрать язык и скачать лучший по числу скачиваний вариант.
+  // Полный автомат: страница сама подсказывает сериал и серию, дальше
+  // берём лучший по числу скачиваний вариант на нужном языке.
   async function osAutoRun() {
     if (osBusy) return;
     if (!target) { osSay('Сначала откройте вкладку с видео.', 'warn'); return; }
@@ -584,7 +616,7 @@
     if (ctx.season) os.season.value = ctx.season;
     if (ctx.episode) os.episode.value = ctx.episode;
     if (!ctx.episode) {
-      osSay('Нашёл «' + ctx.title + '», но номер серии со страницы не читается — впишите его сам' +
+      osSay('Нашёл «' + ctx.title + '», но номер серии со страницы не читается — впишите его сами ' +
         'и нажмите «Авто» ещё раз.', 'warn');
       return;
     }
@@ -613,13 +645,36 @@
     btn.textContent = '…';
     btn.disabled = true;
     var tab = null;
+    var proxy = null;
     try {
-      osSay('Открываю страницу субтитров…');
-      tab = await tabsCreate(subtitleUrl);
-      rememberTempTab(tab.id);
-      if (!await waitTabReady(tab.id, 25000)) throw new Error('Страница субтитров не открылась.');
       osSay('Скачиваю файл…');
-      var res = await sendTab(tab.id, { type: 'OS_FETCH' });
+      var res = null;
+      try {
+        res = await OsNet.download(subtitleUrl);
+      } catch (netErr) {
+        if (!isNetworkError(netErr)) throw netErr;
+        res = null;
+      }
+      if (!res || !res.ok) {
+        // напрямую не вышло — идём через фоновую вкладку сайта
+        osSay('Пробую скачать через сайт…');
+        proxy = await openProxy();
+        if (proxy) {
+          try { res = await OsNet.download(subtitleUrl); } catch (e2) { res = null; }
+          await closeProxy(proxy);
+          proxy = null;
+        }
+      }
+      if (!res || !res.ok) {
+        // последний способ — открыть саму страницу субтитров и нажать кнопку
+        osSay('Пробую скачать со страницы субтитров…');
+        tab = await tabsCreate(subtitleUrl);
+        rememberTempTab(tab.id);
+        if (!await waitTabReady(tab.id, 25000)) throw new Error('Страница субтитров не открылась.');
+        var viaTab = await sendTab(tab.id, { type: 'OS_FETCH' });
+        if (viaTab && viaTab.ok) res = viaTab;
+        else if (viaTab && viaTab.error) throw new Error(viaTab.error);
+      }
       if (!res || !res.ok) throw new Error((res && res.error) || 'Скачать не удалось.');
       await action({ type: 'LOAD_TEXT', text: res.text, name: res.name, encoding: res.encoding });
       osSay('Загружено: ' + res.name + ' — ' + res.count + ' реплик.');
@@ -627,6 +682,7 @@
     } catch (e) {
       osSay((e && e.message) || String(e), 'warn');
     } finally {
+      await closeProxy(proxy);
       if (tab) { await tabsRemove(tab.id); rememberTempTab(null); }
       btn.textContent = old;
       btn.disabled = false;
@@ -640,6 +696,7 @@
   });
   os.search.addEventListener('click', function () { osRun(); });
   os.auto.addEventListener('click', osAutoRun);
+  os.show.addEventListener('change', function () { osRun(); });
   os.lang.addEventListener('change', function () { saveSettings({ preferLang: this.value }); });
   [os.query, os.season, os.episode].forEach(function (el) {
     el.addEventListener('keydown', function (e) { if (e.key === 'Enter') osRun(); });

@@ -817,10 +817,14 @@
         sendResponse({ ok: true, os: isOpenSubtitles(), url: location.href, ready: document.readyState });
         return true;
       }
-      if (msg.type === 'OS_SHOWS' || msg.type === 'OS_COLLECT' || msg.type === 'OS_FETCH') {
+      if (msg.type === 'OS_SHOWS' || msg.type === 'OS_COLLECT' || msg.type === 'OS_FETCH' ||
+          msg.type === 'OS_DOC' || msg.type === 'OS_BIN') {
         if (!isOpenSubtitles() || window.top !== window) return; // отвечает только страница сайта
         if (msg.type === 'OS_SHOWS') { sendResponse(osShows()); return true; }
-        var work = msg.type === 'OS_COLLECT' ? osCollect() : osFetchSubtitle();
+        var work = msg.type === 'OS_COLLECT' ? osCollect()
+          : msg.type === 'OS_DOC' ? osDoc(msg.url)
+          : msg.type === 'OS_BIN' ? osBin(msg.url)
+          : osFetchSubtitle();
         work.then(sendResponse, function (e) {
           sendResponse({ ok: false, error: String((e && e.message) || e) });
         });
@@ -875,6 +879,33 @@
         };
       })
     };
+  }
+
+  // Страница сайта как «почтальон»: попап просит адрес, мы делаем свой
+  // же, same-origin запрос и отдаём готовый текст/байты обратно.
+  async function osDoc(url) {
+    var res = await fetch(url, { credentials: 'include', redirect: 'follow' });
+    if (!res.ok) return { ok: false, error: 'Сайт ответил ошибкой ' + res.status };
+    return { ok: true, url: res.url, html: await res.text() };
+  }
+
+  function fileNameFrom(res, fallback) {
+    var cd = res.headers.get('content-disposition') || '';
+    var m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(cd);
+    if (!m) return fallback;
+    try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
+  }
+
+  async function osBin(url) {
+    var res = await fetch(url, { credentials: 'include', redirect: 'follow' });
+    if (!res.ok) return { ok: false, error: 'Файл не отдался, сайт ответил ' + res.status + '.' };
+    var bytes = new Uint8Array(await res.arrayBuffer());
+    var bin = '';
+    var CHUNK = 0x8000;
+    for (var i = 0; i < bytes.length; i += CHUNK) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    return { ok: true, base64: btoa(bin), name: fileNameFrom(res, 'subtitles.srt') };
   }
 
   function osShows() {
