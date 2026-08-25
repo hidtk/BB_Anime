@@ -351,6 +351,34 @@ check('Готовый ответ содержит языки и счётчик',
   })(),
   { total: 3, langs: ['русский:2', 'английский:1'], best: 'u2' });
 
+// ---------- osnet: отличаем «сайт не пустил» от «ничего не нашлось» ----------
+
+async function grabError(fn) {
+  try { await fn(); return null; } catch (e) { return e; }
+}
+
+{
+  const realFetch = globalThis.fetch;
+
+  globalThis.fetch = async () => ({ ok: false, status: 403, text: async () => '' });
+  const forbidden = await grabError(() => N.fetchDoc('https://www.opensubtitles.com/en'));
+  ok('Ответ 403 помечен как сбой транспорта', !!(forbidden && forbidden.transportFailed),
+    forbidden && forbidden.message);
+  ok('В тексте ошибки видно код ответа', /403/.test((forbidden && forbidden.message) || ''));
+
+  globalThis.fetch = async () => { throw new TypeError('Failed to fetch'); };
+  const dead = await grabError(() => N.fetchDoc('https://www.opensubtitles.com/en'));
+  ok('Оборванный запрос помечен как сбой транспорта', !!(dead && dead.transportFailed),
+    dead && dead.message);
+
+  globalThis.fetch = async () => ({ ok: false, status: 429 });
+  const tooMany = await grabError(() => N.fetchBytes('https://www.opensubtitles.com/x', 'a.srt'));
+  ok('Отказ при скачивании файла тоже помечен как сбой транспорта',
+    !!(tooMany && tooMany.transportFailed), tooMany && tooMany.message);
+
+  globalThis.fetch = realFetch;
+}
+
 // ---------- манифест расширения ----------
 
 {
