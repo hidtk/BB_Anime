@@ -20,6 +20,8 @@ function ok(name, cond, info) {
 }
 const bytes = (s, enc) => Buffer.from(s, enc || 'utf8');
 
+(async function () {
+
 // ---------- кодировки ----------
 
 check('UTF-8 без BOM', S.decodeBytes(bytes('Привет')).encoding, 'utf-8');
@@ -201,6 +203,99 @@ check('Полная ссылка не трогается',
   check('Настоящие субтитры распознаны', O.sniffPayload(srt), 'subtitle');
 }
 
+
+// ---------- распаковка zip с субтитрами ----------
+
+const Z = require(path.join(__dirname, '..', 'extension', 'src', 'subzip.js'));
+const zlib = require('zlib');
+
+// Собираем настоящий zip вручную: так тест не зависит от внешних утилит.
+function makeZip(files) {
+  const enc = new TextEncoder();
+  const locals = [];
+  const central = [];
+  let offset = 0;
+  for (const f of files) {
+    const nameBytes = enc.encode(f.name);
+    const raw = Buffer.from(f.data);
+    const deflated = f.store ? raw : zlib.deflateRawSync(raw);
+    const method = f.store ? 0 : 8;
+    const crc = zlib.crc32 ? zlib.crc32(raw) : 0;
+
+    const lh = Buffer.alloc(30);
+    lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4); lh.writeUInt16LE(method, 8);
+    lh.writeUInt32LE(crc, 14); lh.writeUInt32LE(deflated.length, 18);
+    lh.writeUInt32LE(raw.length, 22); lh.writeUInt16LE(nameBytes.length, 26);
+    locals.push(lh, Buffer.from(nameBytes), deflated);
+
+    const ch = Buffer.alloc(46);
+    ch.writeUInt32LE(0x02014b50, 0); ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6);
+    ch.writeUInt16LE(method, 10); ch.writeUInt32LE(crc, 16);
+    ch.writeUInt32LE(deflated.length, 20); ch.writeUInt32LE(raw.length, 24);
+    ch.writeUInt16LE(nameBytes.length, 28); ch.writeUInt32LE(offset, 42);
+    central.push(ch, Buffer.from(nameBytes));
+
+    offset += lh.length + nameBytes.length + deflated.length;
+  }
+  const centralBuf = Buffer.concat(central);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(files.length, 8); eocd.writeUInt16LE(files.length, 10);
+  eocd.writeUInt32LE(centralBuf.length, 12); eocd.writeUInt32LE(offset, 16);
+  return Buffer.concat([Buffer.concat(locals), centralBuf, eocd]);
+}
+
+check('zip распознаётся по сигнатуре', Z.isZip(new Uint8Array([0x50, 0x4b, 3, 4, 0])), true);
+check('обычный файл за zip не принимается', Z.isZip(new Uint8Array([1, 2, 3, 4, 5])), false);
+
+{
+  const zip = makeZip([
+    { name: 'readme.txt', data: 'мусор рядом с субтитрами' },
+    { name: 'Frieren.S01E05.srt', data: '1\n00:00:01,000 --> 00:00:03,000\nИз архива\n' }
+  ]);
+  check('в архиве видно оба файла', Z.listEntries(new Uint8Array(zip)).length, 2);
+  const got = await Z.extractSubtitle(zip);
+  check('из архива достаётся именно файл субтитров', got.name, 'Frieren.S01E05.srt');
+  check('содержимое распаковано верно',
+    S.parse(Buffer.from(got.bytes).toString('utf8'), got.name).cues[0].html, 'Из архива');
+}
+{
+  const zip = makeZip([{ name: 'sub.ass', data: '[Events]\nDialogue: 0,0:00:01.00,0:00:02.00,D,,0,0,0,,Без сжатия\n', store: true }]);
+  const got = await Z.extractSubtitle(zip);
+  check('файл, положенный в архив без сжатия, тоже читается',
+    S.parse(Buffer.from(got.bytes).toString('utf8'), got.name).cues[0].html, 'Без сжатия');
+}
+{
+  const zip = makeZip([{ name: 'cover.jpg', data: 'не субтитры' }]);
+  check('архив без субтитров честно возвращает пустоту', await Z.extractSubtitle(zip), null);
+}
+check('не-архив не пытается распаковываться',
+  await Z.extractSubtitle(new Uint8Array(Buffer.from('1\n00:00:01,000 --> 00:00:02,000\nтекст\n'))), null);
+
+// ---------- определение серии по странице ----------
+
+{
+  const d1 = O.detectEpisode('https://anidb.app/anime/mushoku-tensei-jobless-reincarnation-3564',
+    'Mushoku Tensei: Jobless Reincarnation — Watch Online Free — AniDB');
+  check('название вытаскивается из заголовка сайта', d1.title, 'Mushoku Tensei: Jobless Reincarnation');
+
+  const d2 = O.detectEpisode('https://site.tv/watch/frieren/season-1/episode-5', 'Frieren watch online');
+  check('сезон и серия из адреса', [d2.season, d2.episode], [1, 5]);
+
+  const d3 = O.detectEpisode('https://x.org/v', 'Bleach S02E13 1080p');
+  check('формат S..E.. в заголовке', [d3.title, d3.season, d3.episode], ['Bleach', 2, 13]);
+
+  const d4 = O.detectEpisode('https://x.org/show?ep=12', 'Naruto Episode 12 online free HD');
+  check('номер серии из параметра ссылки', d4.episode, 12);
+  check('служебные слова из названия вычищены', d4.title, 'Naruto');
+
+  const d5 = O.detectEpisode('https://x.org/anime/one-punch-man-3931', '');
+  check('название собирается из адреса, если заголовка нет', d5.title, 'one punch man');
+
+  const d6 = O.detectEpisode('https://x.org/', 'Просто сайт');
+  check('без признаков серии номер не выдумывается', [d6.season, d6.episode], [null, null]);
+}
+
 // ---------- манифест расширения ----------
 
 {
@@ -223,3 +318,4 @@ if (failures.length) {
   console.log('Провалились:\n - ' + failures.join('\n - '));
   process.exit(1);
 }
+})();
