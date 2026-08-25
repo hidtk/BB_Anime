@@ -174,6 +174,21 @@
       el.pickBtn.disabled = true;
       return;
     }
+    // Ответ content script старой версии (до 1.1): поля frames там нет.
+    // Так бывает, когда расширение обновили, а вкладку не перезагрузили —
+    // Chrome оставляет в открытых вкладках прежний код.
+    if (!res.frames) {
+      el.status.textContent = 'Вкладка работает на старой версии расширения.';
+      el.status.className = 'status warn';
+      el.diag.textContent = 'Нажмите F5 на вкладке с видео: Chrome подхватывает обновление расширения только при перезагрузке страницы.';
+      el.videoSection.classList.add('hidden');
+      el.shiftSection.classList.add('hidden');
+      el.fileInfo.classList.add('hidden');
+      el.clearBtn.classList.add('hidden');
+      el.pickBtn.disabled = true;
+      return;
+    }
+
     el.pickBtn.disabled = false;
     var view = flatten(res);
     pickTarget(view);
@@ -182,10 +197,10 @@
     var framesWithVideo = view.frames.filter(function (f) { return (f.videos || []).length; }).length;
 
     if (!view.videos.length) {
-      el.status.textContent = 'Видео на странице не найдено. Запустите воспроизведение и откройте попап снова.';
+      el.status.textContent = 'Видео на странице не найдено. Нажмите Play и откройте попап снова.';
       el.status.className = 'status warn';
       el.diag.textContent = 'Проверено областей страницы (фреймов): ' + view.frames.length +
-        '. Если видео точно идёт — обновите вкладку клавишей F5 и попробуйте ещё раз.';
+        '. На многих сайтах плеер создаётся только после запуска серии. Если видео уже идёт — обновите вкладку клавишей F5.';
       el.videoSection.classList.add('hidden');
     } else {
       var inFrame = frame && !frame.isTop;
