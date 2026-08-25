@@ -1,12 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Subtitle Overlay — субтитры поверх видео",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Накладывает субтитры .srt / .ass поверх любого HTML5-видео. Работает в полноэкранном режиме, с подстройкой тайминга.",
   "permissions": [
     "storage",
     "activeTab",
     "scripting"
+  ],
+  "host_permissions": [
+    "https://www.opensubtitles.com/*"
   ],
   "action": {
     "default_title": "Subtitle Overlay",
