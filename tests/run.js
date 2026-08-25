@@ -523,6 +523,72 @@ async function overlayText(page) {
   check('OpenSubtitles: ссылки достроены до абсолютных',
     osAll.bestRu && osAll.bestRu.url.startsWith('https://www.opensubtitles.com/'), true);
 
+  // ---- сквозной поиск серии через подменённый транспорт ----
+  await osPage.addScriptTag({ path: path.join(__dirname, '..', 'extension', 'src', 'osnet.js') });
+  const episodeHtml = fsmod.readFileSync(path.join(__dirname, 'os-episode.html'), 'utf8');
+  const chain = await osPage.evaluate(async (epHtml) => {
+    const asked = [];
+    const SHOWS = '<html><body>' +
+      '<a href="/en/tvshows/2021-mushoku-tensei-jobless-reincarnation">Mushoku Tensei: Jobless Reincarnation</a>' +
+      '<a href="/en/tvshows/2023-mushoku-tensei-ii-jobless-reincarnation">Mushoku Tensei II: Jobless Reincarnation</a>' +
+      '<a href="/en/movies/2019-some-other-thing">Some Other Thing</a>' +
+      '<a href="/en/tvshows/popular">Popular</a></body></html>';
+    const SHOW_PAGE = '<html><body><a href="/en/all/search-tvshows/q-osdb:1005706/season-1/episode-">все серии</a></body></html>';
+    OsNet.setTransport({
+      text: async (url) => {
+        asked.push(url);
+        if (url.indexOf('search-all') !== -1) return SHOWS;
+        if (url.indexOf('/tvshows/2021-') !== -1) return SHOW_PAGE;
+        if (url.indexOf('/tvshows/2023-') !== -1) return '<html><body>нет id</body></html>';
+        if (url.indexOf('search-tvshows') !== -1 && url.indexOf('episode-3') !== -1) return epHtml;
+        return '<html><body></body></html>';
+      }
+    });
+    const steps = [];
+    const res = await OsNet.searchEpisode({
+      query: 'Mushoku Tensei: Jobless Reincarnation', season: 1, episode: 3,
+      onStep: (t) => steps.push(t)
+    });
+    OsNet.setTransport(null);
+    return {
+      total: res.total,
+      langs: res.languages.map(l => l.label + ':' + l.count),
+      bestRu: (res.languages.find(l => l.code === 'ru') || {}).best,
+      show: res.show && res.show.title,
+      asked: asked,
+      steps: steps.length
+    };
+  }, episodeHtml);
+  check('Сквозной поиск: собраны все строки страницы результатов', chain.total, 5);
+  check('Сквозной поиск: языки сгруппированы',
+    chain.langs, ['русский:2', 'английский:1', '日本語:1', 'Deutsch:1']);
+  check('Сквозной поиск: выбран нужный сериал', chain.show, 'Mushoku Tensei: Jobless Reincarnation');
+  check('Сквозной поиск: лучший русский вариант — самый скачиваемый',
+    chain.bestRu && chain.bestRu.url.endsWith('/en/subtitles/mt-s01e03-ru2'), true);
+  check('Сквозной поиск: запросов ровно три (поиск, сериал, серия)', chain.asked.length, 3);
+  check('Сквозной поиск: адрес серии собран правильно',
+    chain.asked[2],
+    'https://www.opensubtitles.com/en/all/search-tvshows/q-osdb:1005706/hearing_impaired-/machine_translated-/trusted_sources-/season-1/episode-3');
+  check('Сквозной поиск: пользователю показаны шаги', chain.steps >= 3, true);
+
+  const fallback = await osPage.evaluate(async (epHtml) => {
+    const asked = [];
+    OsNet.setTransport({
+      text: async (url) => {
+        asked.push(url);
+        if (url.indexOf('search-all') !== -1 && url.indexOf('S01E03') !== -1) return epHtml;
+        return '<html><body></body></html>';
+      }
+    });
+    let res = null, err = null;
+    try { res = await OsNet.searchEpisode({ query: 'Неизвестное', season: 1, episode: 3 }); }
+    catch (e) { err = e.message; }
+    OsNet.setTransport(null);
+    return { total: res && res.total, err: err, last: asked[asked.length - 1] };
+  }, episodeHtml);
+  check('Сериала нет в базе — работает прямой поиск по «название S01E03»', fallback.total, 5);
+  check('Запасной запрос содержит номер серии', /S01E03/.test(fallback.last || ''), true);
+
   const osPassive = await osPage.evaluate(() => document.querySelectorAll('[data-sub-overlay]').length);
   check('OpenSubtitles: на странице без видео оверлей не рисуется',
     osPassive === 0 && osErrors.length === 0, JSON.stringify(osErrors));

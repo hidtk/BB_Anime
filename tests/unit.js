@@ -296,6 +296,61 @@ check('не-архив не пытается распаковываться',
   check('без признаков серии номер не выдумывается', [d6.season, d6.episode], [null, null]);
 }
 
+// ---------- osnet: подбор названия и ссылки на файл ----------
+
+globalThis.OpenSubs = O;
+const N = require(path.join(__dirname, '..', 'extension', 'src', 'osnet.js'));
+
+check('Варианты названия: сначала полное, потом до двоеточия',
+  N.titleVariants('Mushoku Tensei: Jobless Reincarnation').slice(0, 3),
+  ['Mushoku Tensei: Jobless Reincarnation', 'Mushoku Tensei', 'Jobless Reincarnation']);
+check('Варианты названия: номер сезона отбрасывается',
+  N.titleVariants('Overlord 2nd Season').indexOf('Overlord') !== -1, true);
+check('Короткое название не размножается', N.titleVariants('Bleach'), ['Bleach']);
+
+check('Точное совпадение названия получает максимум',
+  N.scoreShow({ title: 'Frieren Beyond Journeys End' }, 'frieren beyond journeys end'), 100);
+check('Совпадение по началу названия ценится высоко',
+  N.scoreShow({ title: 'Mushoku Tensei: Jobless Reincarnation' }, 'Mushoku Tensei') >= 80, true);
+check('Чужой сериал получает мало очков',
+  N.scoreShow({ title: 'Naruto Shippuden' }, 'Mushoku Tensei') < 20, true);
+
+check('Сериалы идут раньше фильмов, точное название — первым',
+  N.rankShows([
+    { title: 'Mushoku Tensei', isSeries: false, url: 'a' },
+    { title: 'Mushoku Tensei II: Jobless Reincarnation', isSeries: true, url: 'b' },
+    { title: 'Mushoku Tensei: Jobless Reincarnation', isSeries: true, url: 'c' }
+  ], 'Mushoku Tensei: Jobless Reincarnation', true).map(s => s.url),
+  ['c', 'b', 'a']);
+
+function fakeDoc(map) {
+  return {
+    querySelector: function (sel) {
+      const href = map[sel];
+      if (!href) return null;
+      return { getAttribute: function (a) { return a === 'href' ? href : null; } };
+    }
+  };
+}
+check('Ссылка на файл берётся из готового атрибута',
+  N.downloadHref(fakeDoc({ 'a[download][href]': '/en/subtitleserve/sub/777' }), 'x').url,
+  'https://www.opensubtitles.com/en/subtitleserve/sub/777');
+check('Без ссылки адрес файла собирается из номера субтитров',
+  N.downloadHref(fakeDoc({}), 'https://www.opensubtitles.com/en/subtitles/12345/frieren-ru').url,
+  'https://www.opensubtitles.com/en/subtitleserve/sub/12345');
+check('Совсем без зацепок ссылки нет', N.downloadHref(fakeDoc({}), '/en/tvshows/x'), null);
+
+check('Готовый ответ содержит языки и счётчик',
+  (function () {
+    const r = N.pack([
+      { code: 'ru', name: 'русский язык', label: 'русский', url: 'u1', release: 'r1', downloads: 5 },
+      { code: 'ru', name: 'русский язык', label: 'русский', url: 'u2', release: 'r2', downloads: 50 },
+      { code: 'en', name: 'English', label: 'английский', url: 'u3', release: 'r3', downloads: 9 }
+    ], 'url');
+    return { total: r.total, langs: r.languages.map(l => l.label + ':' + l.count), best: r.languages[0].best.url };
+  })(),
+  { total: 3, langs: ['русский:2', 'английский:1'], best: 'u2' });
+
 // ---------- манифест расширения ----------
 
 {
@@ -303,7 +358,8 @@ check('не-архив не пытается распаковываться',
   const m = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'extension', 'manifest.json'), 'utf8'));
   check('Манифест: третья версия', m.manifest_version, 3);
   check('Манифест: разрешения минимальны', m.permissions.sort(), ['activeTab', 'scripting', 'storage']);
-  check('Манифест: нет host_permissions сверх content_scripts', m.host_permissions, undefined);
+  check('Манифест: доступ к сайту субтитров запрошен явно',
+    m.host_permissions, ['https://www.opensubtitles.com/*']);
   check('Манифест: content script во всех фреймах', m.content_scripts[0].all_frames, true);
   ok('Манифест: все файлы скриптов на месте',
     m.content_scripts[0].js.every(f => fs.existsSync(path.join(__dirname, '..', 'extension', f))));
@@ -311,6 +367,10 @@ check('не-архив не пытается распаковываться',
     Object.values(m.icons).every(f => fs.existsSync(path.join(__dirname, '..', 'extension', f))));
   ok('Манифест: попап на месте',
     fs.existsSync(path.join(__dirname, '..', 'extension', m.action.default_popup)));
+  const popupHtml = fs.readFileSync(path.join(__dirname, '..', 'extension', 'src', 'popup.html'), 'utf8');
+  ok('Попап подключает сетевой модуль поиска', popupHtml.indexOf('osnet.js') !== -1);
+  ok('Файл сетевого модуля на месте',
+    fs.existsSync(path.join(__dirname, '..', 'extension', 'src', 'osnet.js')));
 }
 
 console.log('\n' + passed + '/' + (passed + failures.length) + ' проверок пройдено');
