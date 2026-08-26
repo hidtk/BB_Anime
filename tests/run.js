@@ -594,6 +594,87 @@ async function overlayText(page) {
     osPassive === 0 && osErrors.length === 0, JSON.stringify(osErrors));
   await osPage.close();
 
+  // ---- подгонка субтитров по звуку ----
+  // В ролике тон включается всплесками, а субтитры к нему сдвинуты ровно
+  // на 2,5 секунды: правильный ответ известен заранее.
+  await fpage.close();
+  await fpopup.close();
+
+  const syncPage = await ctx.newPage();
+  const syncErrors = [];
+  syncPage.on('pageerror', e => syncErrors.push(e.message));
+  await syncPage.goto(BASE + '/sync-page.html');
+  await sleep(1500);
+
+  const syncPopup = await ctx.newPage();
+  await syncPopup.goto(popupUrl);
+  await sleep(1600);
+  await syncPopup.setInputFiles('#fileInput', FIX('sync-subs.srt'));
+  await sleep(1200);
+  const syncInfo = await syncPopup.textContent('#fileInfo');
+  check('Подгонка: субтитры фикстуры загружены', /44 реплик/.test(syncInfo || ''), syncInfo);
+
+  await syncPage.bringToFront();
+  await syncPage.evaluate(async () => {
+    const v = document.getElementById('v');
+    v.playbackRate = 2;          // ускоряем, чтобы тест не шёл минуту
+    v.currentTime = 0;
+    try { await v.play(); } catch (e) {}
+  });
+  await sleep(600);
+
+  // Разговор с нужной вкладкой: адресов вкладок расширение не знает
+  // (и незачем), поэтому просто спрашиваем каждую, как это делает попап.
+  async function talkToVideoTab(message) {
+    return syncPopup.evaluate(async (msg) => {
+      const tabs = await new Promise(r => chrome.tabs.query({}, r));
+      for (const t of tabs) {
+        const res = await new Promise(r => chrome.tabs.sendMessage(
+          t.id, msg, { frameId: 0 }, x => r(chrome.runtime.lastError ? null : x)));
+        if (res) return res;
+      }
+      return null;
+    }, message);
+  }
+  async function videoTabSub() {
+    const res = await talkToVideoTab({ type: 'PING' });
+    const frames = (res && res.frames) || [];
+    for (const f of frames) if (f.sub && f.sub.count === 44) return f.sub;
+    return null;
+  }
+
+  // сначала кнопка в попапе: она должна запустить прослушивание
+  await syncPopup.evaluate(() => document.getElementById('autoSync').click());
+  await syncPage.bringToFront();
+  await sleep(1200);
+  const syncStarted = await videoTabSub();
+  check('Подгонка: кнопка в попапе запускает прослушивание',
+    !!(syncStarted && syncStarted.sync && syncStarted.sync.running), true);
+  await talkToVideoTab({ type: 'ACTION', msg: { type: 'CANCEL_SYNC' } });
+  await sleep(300);
+
+  // теперь короткий прогон, чтобы тест не ждал полторы минуты
+  await talkToVideoTab({ type: 'ACTION', msg: { type: 'AUTO_SYNC', minSeconds: 20, maxSeconds: 40 } });
+  await syncPage.bringToFront();
+
+  let syncDone = null;
+  for (let i = 0; i < 50 && !syncDone; i++) {
+    await sleep(1000);
+    const sub = await videoTabSub();
+    if (sub && sub.sync && !sub.sync.running) syncDone = { sync: sub.sync, shift: sub.shift };
+  }
+  check('Подгонка: сдвиг найден по звуку',
+    !!syncDone && syncDone.sync.shift !== null && Math.abs(syncDone.sync.shift - 2.5) <= 0.25,
+    JSON.stringify(syncDone));
+  check('Подгонка: найденный сдвиг сразу применён к субтитрам',
+    !!syncDone && Math.abs(syncDone.shift - syncDone.sync.shift) < 0.001, true);
+  check('Подгонка: воспроизведение не сломалось',
+    await syncPage.evaluate(() => { const v = document.getElementById('v'); return !v.paused && v.currentTime > 1; }),
+    true);
+  check('Подгонка: без ошибок на странице', syncErrors.length === 0, true);
+  await syncPopup.close();
+  await syncPage.close();
+
   check('Нет ошибок в консоли страницы', realErrors.length === 0, realErrors.join(' | ') || ('всего сообщений: ' + errors.length));
   check('Нет ошибок в попапе', popupErrors.length === 0, popupErrors.join(' | '));
 
