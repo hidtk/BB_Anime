@@ -20,6 +20,8 @@
     shiftSection: document.getElementById('shiftSection'),
     shiftValue: document.getElementById('shiftValue'),
     resetShift: document.getElementById('resetShift'),
+    autoSync: document.getElementById('autoSync'),
+    syncLine: document.getElementById('syncLine'),
     currentLine: document.getElementById('currentLine'),
     fontSize: document.getElementById('fontSize'),
     fontSizeVal: document.getElementById('fontSizeVal'),
@@ -285,6 +287,7 @@
       ));
       el.shiftValue.textContent = fmtShift(sub.shift || 0);
       el.currentLine.textContent = sub.currentText ? '«' + sub.currentText + '»' : '';
+      renderSync(sub.sync);
     } else {
       el.fileInfo.classList.add('hidden');
       el.clearBtn.classList.add('hidden');
@@ -355,6 +358,38 @@
   el.clearBtn.addEventListener('click', async function () {
     await action({ type: 'CLEAR' });
     apply(await ping());
+  });
+
+  // Что сейчас с подгонкой по звуку: идёт, получилось, не получилось.
+  function renderSync(sync) {
+    el.autoSync.disabled = !!(sync && sync.running);
+    if (!sync) { el.syncLine.textContent = ''; el.syncLine.className = 'hint'; return; }
+    if (sync.running) {
+      el.syncLine.textContent = 'Слушаю звук… можно закрыть окно, субтитры подстроятся сами.';
+      el.syncLine.className = 'hint';
+      return;
+    }
+    if (sync.shift === null || sync.shift === undefined) {
+      el.syncLine.textContent = 'Подстроить не вышло' + (sync.reason ? ': ' + sync.reason : '') + '.';
+      el.syncLine.className = 'hint warn';
+      return;
+    }
+    el.syncLine.textContent = 'Подстроено по звуку: ' + fmtShift(sync.shift) +
+      (sync.confidence ? ' (уверенность ' + sync.confidence + ')' : '');
+    el.syncLine.className = 'hint';
+  }
+
+  el.autoSync.addEventListener('click', async function () {
+    var res = await action({ type: 'AUTO_SYNC' });
+    if (res && res.ok) {
+      el.syncLine.textContent = 'Слушаю звук… можно закрыть окно, субтитры подстроятся сами.';
+      el.syncLine.className = 'hint';
+      el.autoSync.disabled = true;
+    } else {
+      el.syncLine.textContent = (res && res.error) || 'Не удалось начать подгонку.';
+      el.syncLine.className = 'hint warn';
+    }
+    setTimeout(async function () { apply(await ping()); }, 600);
   });
 
   el.resetShift.addEventListener('click', async function () {
@@ -511,22 +546,23 @@
     });
   }
 
-  // Прямые запросы из попапа сайт часто отбивает кодом 403 (защита от
-  // ботов не любит заголовок chrome-extension://). Признак запоминаем,
-  // чтобы в следующий раз сразу идти через вкладку и не терять время.
-  var osDirectBlocked = false;
+  // Сайты не любят запросы «от расширения»: opensubtitles.com отвечает на
+  // них 403. Такой отказ мы запоминаем и в следующий раз сразу идём через
+  // фоновую вкладку самого сайта — оттуда запросы обычные, свои.
+  var directBlocked = { os: false, tosho: false };
 
   try {
-    chrome.storage.local.get('osDirectBlocked', function (r) {
+    chrome.storage.local.get('directBlocked', function (r) {
       if (chrome.runtime.lastError) return;
-      osDirectBlocked = !!(r && r.osDirectBlocked);
+      var saved = r && r.directBlocked;
+      if (saved) directBlocked = Object.assign(directBlocked, saved);
     });
   } catch (e) {}
 
-  function markDirectBlocked() {
-    if (osDirectBlocked) return;
-    osDirectBlocked = true;
-    try { chrome.storage.local.set({ osDirectBlocked: true }, function () { void chrome.runtime.lastError; }); } catch (e) {}
+  function markBlocked(key) {
+    if (directBlocked[key]) return;
+    directBlocked[key] = true;
+    try { chrome.storage.local.set({ directBlocked: directBlocked }, function () { void chrome.runtime.lastError; }); } catch (e) {}
   }
 
   function needsFallback(e) {
@@ -535,17 +571,20 @@
     return (e instanceof TypeError) || /failed to fetch|networkerror|load failed/i.test(m);
   }
 
-  // Одна фоновая вкладка сайта на всю операцию: через неё идут запросы,
-  // если прямые из попапа не проходят.
-  async function openProxy() {
-    var tab = await tabsCreate(OpenSubs.ORIGIN + '/en');
+  var PROVIDERS = {
+    tosho: { key: 'tosho', name: 'AnimeTosho', api: Tosho, start: Tosho.ORIGIN + '/' },
+    os: { key: 'os', name: 'OpenSubtitles', api: OsNet, start: OpenSubs.ORIGIN + '/en' }
+  };
+
+  async function openProxy(prov) {
+    var tab = await tabsCreate(prov.start);
     rememberTempTab(tab.id);
     if (!await waitTabReady(tab.id, 25000)) {
       await tabsRemove(tab.id);
       rememberTempTab(null);
       return null;
     }
-    OsNet.setTransport({
+    prov.api.setTransport({
       text: async function (url) {
         var r = await sendTab(tab.id, { type: 'OS_DOC', url: url });
         if (!r || !r.ok) throw new Error((r && r.error) || 'Страница не прочиталась.');
@@ -558,13 +597,79 @@
     return tab;
   }
 
-  async function closeProxy(tab) {
-    OsNet.setTransport(null);
+  async function closeProxy(prov, tab) {
+    if (prov) prov.api.setTransport(null);
     if (tab) { await tabsRemove(tab.id); rememberTempTab(null); }
   }
 
-  // Основной путь: обычные запросы к opensubtitles.com прямо отсюда.
-  // Страница поиска отдаёт сразу все строки таблицы, листать не нужно.
+  // Делает работу провайдера: сначала напрямую, а если сайт не пустил —
+  // через одну фоновую вкладку этого же сайта.
+  async function viaProvider(prov, job) {
+    if (!directBlocked[prov.key]) {
+      try { return await job(); }
+      catch (e) {
+        if (!needsFallback(e)) throw e;
+        markBlocked(prov.key);
+      }
+    }
+    osSay('Открываю ' + prov.name + ' в фоне…');
+    var tab = await openProxy(prov);
+    if (!tab) throw new Error('Не удалось открыть ' + prov.name + '. Откройте сайт вручную один раз и попробуйте снова.');
+    try { return await job(); }
+    finally { await closeProxy(prov, tab); }
+  }
+
+  function preferredShow() {
+    var idx = parseInt(os.show.value, 10);
+    return (!os.showRow.classList.contains('hidden') && osShows && osShows[idx]) ? osShows[idx] : null;
+  }
+
+  // Сначала AnimeTosho: там аниме, ключи не нужны, а серия находится по
+  // номеру из базы AniDB, а не по угаданному названию. Если не вышло —
+  // остаётся opensubtitles.
+  async function searchEverywhere(q, season, episode) {
+    var problems = [];
+
+    try {
+      var t = await viaProvider(PROVIDERS.tosho, function () {
+        return Tosho.searchEpisode({
+          query: q, season: season, episode: episode,
+          stopAt: os.lang.value, onStep: function (s) { osSay(s); }
+        });
+      });
+      if (t && t.rows && t.rows.length) {
+        var rows = t.rows.map(function (r) {
+          return {
+            code: r.code, name: r.label,
+            label: OpenSubs.langLabel(r.code, r.label),
+            url: r.url, release: r.release, downloads: r.downloads
+          };
+        });
+        var packed = OsNet.pack(rows, Tosho.ORIGIN);
+        packed.source = 'AnimeTosho';
+        return packed;
+      }
+    } catch (e) {
+      problems.push('AnimeTosho: ' + ((e && e.message) || e));
+    }
+
+    try {
+      var o = await viaProvider(PROVIDERS.os, function () {
+        return OsNet.searchEpisode({
+          query: q, season: season, episode: episode,
+          preferShow: preferredShow(), onStep: function (s) { osSay(s); }
+        });
+      });
+      o.source = 'OpenSubtitles';
+      return o;
+    } catch (e) {
+      problems.push('OpenSubtitles: ' + ((e && e.message) || e));
+    }
+
+    var err = new Error(problems.join('  ·  '));
+    throw err;
+  }
+
   async function osRun() {
     if (osBusy) return;
     var q = os.query.value.trim();
@@ -577,46 +682,18 @@
     os.auto.disabled = true;
     os.results.innerHTML = '';
     var found = null;
-    var proxy = null;
-
-    function show(data) {
+    try {
+      var data = await searchEverywhere(q, season, episode);
       if (data.shows && data.shows.length > 1) renderShows(data.shows);
       if (data.season) os.season.value = String(data.season);
       renderLanguages(data);
-      osSay('Найдено вариантов: ' + data.total + ', языков: ' + data.languages.length + '.');
-    }
-    function attempt() {
-      var idx = parseInt(os.show.value, 10);
-      var prefer = (!os.showRow.classList.contains('hidden') && osShows && osShows[idx]) ? osShows[idx] : null;
-      return OsNet.searchEpisode({
-        query: q, season: season, episode: episode, preferShow: prefer,
-        onStep: function (t) { osSay(t); }
-      });
-    }
-
-    try {
-      var data = null;
-      if (!osDirectBlocked) {
-        try {
-          data = await attempt();
-        } catch (e) {
-          if (!needsFallback(e)) throw e;
-          markDirectBlocked();
-        }
-      }
-      if (!data) {
-        osSay('Открываю opensubtitles.com в фоне…');
-        proxy = await openProxy();
-        if (!proxy) throw new Error('Не удалось открыть opensubtitles.com. Откройте сайт вручную один раз и попробуйте снова.');
-        data = await attempt();
-      }
-      show(data);
+      osSay('Нашёл на ' + (data.source || 'сайте') + ': вариантов ' + data.total +
+        ', языков ' + data.languages.length + '.');
       found = data;
     } catch (e) {
       if (e && e.shows && e.shows.length > 1) renderShows(e.shows);
       osSay((e && e.message) || String(e), 'warn');
     } finally {
-      await closeProxy(proxy);
       os.search.disabled = false;
       os.auto.disabled = false;
       osBusy = false;
@@ -625,7 +702,7 @@
   }
 
   // Полный автомат: страница сама подсказывает сериал и серию, дальше
-  // берём лучший по числу скачиваний вариант на нужном языке.
+  // берём лучший вариант на нужном языке.
   async function osAutoRun() {
     if (osBusy) return;
     if (!target) { osSay('Сначала откройте вкладку с видео.', 'warn'); return; }
@@ -668,66 +745,46 @@
     btn.textContent = '…';
     btn.disabled = true;
     var tab = null;
-    var proxy = null;
+    var prov = Tosho.handles(subtitleUrl) ? PROVIDERS.tosho : PROVIDERS.os;
     try {
       osSay('Скачиваю файл…');
       var res = null;
       var why = '';
-      var blocked = false;
-
-      async function tryDownload() {
-        try {
-          var r = await OsNet.download(subtitleUrl);
-          if (r && r.ok) return r;
-          // ответ пришёл, но это не субтитры (лимит, rar, страница сайта)
-          why = (r && r.error) || why;
-          return null;
-        } catch (e) {
-          if (!needsFallback(e)) throw e;
-          blocked = true;
-          why = e.message || why;
-          return null;
-        }
+      try {
+        res = await viaProvider(prov, function () { return prov.api.download(subtitleUrl); });
+        if (res && !res.ok) { why = res.error || ''; res = null; }
+      } catch (e) {
+        if (!needsFallback(e)) throw e;
+        why = (e && e.message) || '';
+        res = null;
       }
 
-      if (!osDirectBlocked) {
-        res = await tryDownload();
-        if (!res && blocked) markDirectBlocked();
-      }
-      if (!res) {
-        // напрямую не вышло — идём через фоновую вкладку сайта
-        osSay('Скачиваю через сайт…');
-        proxy = await openProxy();
-        if (proxy) {
-          res = await tryDownload();
-          await closeProxy(proxy);
-          proxy = null;
-        }
-      }
-      if (!res || !res.ok) {
-        // последний способ — открыть саму страницу субтитров и нажать кнопку
+      if (!res && prov === PROVIDERS.os) {
+        // последний способ для opensubtitles — открыть страницу субтитров
+        // и дать сайту самому подставить ссылку на файл
         osSay('Пробую скачать со страницы субтитров…');
         tab = await tabsCreate(subtitleUrl);
         rememberTempTab(tab.id);
         if (!await waitTabReady(tab.id, 25000)) throw new Error('Страница субтитров не открылась.');
         var viaTab = await sendTab(tab.id, { type: 'OS_FETCH' });
         if (viaTab && viaTab.ok) res = viaTab;
-        else if (viaTab && viaTab.error) throw new Error(viaTab.error);
+        else if (viaTab && viaTab.error) why = viaTab.error;
       }
-      if (!res || !res.ok) throw new Error((res && res.error) || why || 'Скачать не удалось.');
+
+      if (!res || !res.ok) throw new Error(why || 'Скачать не удалось.');
       await action({ type: 'LOAD_TEXT', text: res.text, name: res.name, encoding: res.encoding });
       osSay('Загружено: ' + res.name + ' — ' + res.count + ' реплик.');
       setTimeout(async function () { apply(await ping()); }, 200);
     } catch (e) {
       osSay((e && e.message) || String(e), 'warn');
     } finally {
-      await closeProxy(proxy);
       if (tab) { await tabsRemove(tab.id); rememberTempTab(null); }
       btn.textContent = old;
       btn.disabled = false;
       osBusy = false;
     }
   }
+
 
   os.toggle.addEventListener('click', function () {
     os.panel.classList.toggle('hidden');

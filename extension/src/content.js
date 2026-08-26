@@ -31,7 +31,8 @@
     pendingRestore: null,
     rafId: 0,
     lastRect: null,
-    hidden: false
+    hidden: false,
+    lastSync: null
   };
 
   var host = null, shadow = null, box = null, textEl = null, toastEl = null, dropEl = null;
@@ -576,6 +577,121 @@
       (state.shift === 0 ? '' : state.shift > 0 ? ' (позже)' : ' (раньше)'));
   }
 
+  // ---------------- подгонка по звуку ----------------
+
+  // Слушаем звук самого видео и сравниваем «когда говорят» с «когда должна
+  // быть реплика». Совпадение даёт сдвиг — тот же, что руками на G и H.
+
+  var audioCtx = null;
+  var audioTaps = new WeakMap();
+  var syncRun = null;
+
+  function ensureTap(v) {
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) throw new Error('браузер не даёт слушать звук');
+    if (!audioCtx) audioCtx = new Ctx();
+    if (audioCtx.state === 'suspended') { try { audioCtx.resume(); } catch (e) {} }
+    var tap = audioTaps.get(v);
+    if (!tap) {
+      // источник у элемента может быть только один — поэтому и держим WeakMap
+      var src = audioCtx.createMediaElementSource(v);
+      var analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.15;
+      src.connect(analyser);
+      analyser.connect(audioCtx.destination); // звук должен продолжать играть
+      tap = { src: src, analyser: analyser, data: new Uint8Array(analyser.frequencyBinCount) };
+      audioTaps.set(v, tap);
+    }
+    return tap;
+  }
+
+  // Громкость считаем только в речевой полосе: бас музыки и высокие
+  // шумы в неё не попадают, поэтому дорожка ближе к настоящей речи.
+  function speechLevel(tap) {
+    var a = tap.analyser;
+    a.getByteFrequencyData(tap.data);
+    var perBin = (audioCtx.sampleRate / 2) / tap.data.length;
+    var from = Math.max(1, Math.floor(300 / perBin));
+    var to = Math.min(tap.data.length - 1, Math.ceil(3400 / perBin));
+    var sum = 0;
+    for (var i = from; i <= to; i++) sum += tap.data[i];
+    return sum / ((to - from + 1) * 255);
+  }
+
+  function stopSync(message, kind) {
+    if (!syncRun) return;
+    clearInterval(syncRun.timer);
+    syncRun = null;
+    if (message) toast(message, kind);
+  }
+
+  function autoSync(opts) {
+    opts = opts || {};
+    if (!state.cues.length) return { ok: false, error: 'Сначала загрузите субтитры.' };
+    if (!state.video) return { ok: false, error: 'Видео на странице не найдено.' };
+    if (syncRun) return { ok: false, error: 'Уже слушаю звук — подождите.' };
+
+    var v = state.video;
+    var tap;
+    try {
+      tap = ensureTap(v);
+    } catch (e) {
+      return { ok: false, error: 'Не получилось послушать звук: ' + ((e && e.message) || e) };
+    }
+
+    var minSeconds = opts.minSeconds || 40;
+    var maxSeconds = opts.maxSeconds || 90;
+    var run = {
+      samples: [],
+      timer: 0,
+      told: 0,
+      started: Date.now()
+    };
+    syncRun = run;
+    state.lastSync = { running: true, shift: null, reason: '' };
+    toast('Слушаю звук, чтобы подстроить субтитры…');
+
+    function finish(res) {
+      state.lastSync = {
+        running: false,
+        shift: res && res.ok ? res.shift : null,
+        confidence: res ? res.confidence : 0,
+        reason: res && res.reason ? res.reason : ''
+      };
+      if (res && res.ok) {
+        setShift(res.shift);
+        stopSync('Субтитры подстроены: сдвиг ' + (res.shift > 0 ? '+' : '') +
+          res.shift.toFixed(2) + ' с', 'ok');
+      } else {
+        stopSync('Подстроить не вышло (' + ((res && res.reason) || 'нет данных') +
+          '). Оставил как было — можно поправить на G и H.', 'warn');
+      }
+    }
+
+    run.timer = setInterval(function () {
+      if (!syncRun || syncRun !== run) return;
+      if (!state.video || !state.video.isConnected) return finish(null);
+      if (state.video.paused || state.video.seeking) return;
+
+      var level;
+      try { level = speechLevel(tap); } catch (e) { return finish(null); }
+      run.samples.push({ time: state.video.currentTime, level: level });
+
+      var recorded = run.samples.length * 0.04;
+      if (recorded - run.told >= 20) {
+        run.told = recorded;
+        toast('Слушаю: ' + Math.round(recorded) + ' с из ' + maxSeconds);
+      }
+      if (recorded < minSeconds) return;
+
+      var res = SubSync.estimateShift({ samples: run.samples, cues: state.cues });
+      if (res.ok || recorded >= maxSeconds) finish(res);
+    }, 40);
+
+    return { ok: true, started: true };
+  }
+
   function typingTarget(el) {
     if (!el) return false;
     var t = el.tagName;
@@ -587,6 +703,11 @@
   function applyHotkey(action) {
     if (!state.cues.length) return false;
     if (action === 'reset') { setShift(0); toast('Сдвиг сброшен'); return true; }
+    if (action === 'autosync') {
+      var r = autoSync();
+      if (!r.ok) toast(r.error, 'warn');
+      return true;
+    }
     var map = { back: -0.5, fwd: 0.5, bigback: -5, bigfwd: 5 };
     if (!(action in map)) return false;
     bumpShift(map[action]);
@@ -615,19 +736,22 @@
     if (e.code === 'KeyG') action = e.shiftKey ? 'bigback' : 'back';
     else if (e.code === 'KeyH') action = e.shiftKey ? 'bigfwd' : 'fwd';
     else if (e.code === 'KeyJ' && !e.shiftKey) action = 'reset';
+    else if (e.code === 'KeyK' && !e.shiftKey) action = 'autosync';
     if (!action) return;
     if (applyHotkey(action)) { e.preventDefault(); e.stopPropagation(); }
     else broadcastHotkey(action);
   }, true);
 
-  function toast(msg) {
+  function toast(msg, kind) {
     if (!state.video) return;
     ensureOverlay();
     if (!toastEl) return;
     toastEl.textContent = msg;
     toastEl.classList.add('show');
     clearTimeout(toast._t);
-    toast._t = setTimeout(function () { toastEl && toastEl.classList.remove('show'); }, 1800);
+    // важные ответы («подстроил», «не вышло») висят дольше обычных
+    var hold = kind === 'ok' || kind === 'warn' ? 4200 : 1800;
+    toast._t = setTimeout(function () { toastEl && toastEl.classList.remove('show'); }, hold);
   }
 
   // ---------------- drag & drop ----------------
@@ -721,7 +845,8 @@
         fromMemory: state.fromMemory,
         shift: state.shift,
         currentTime: state.video ? state.video.currentTime : 0,
-        currentText: (state.lastHtml || '').replace(/<br>/g, ' / ').replace(/<[^>]+>/g, '')
+        currentText: (state.lastHtml || '').replace(/<br>/g, ' / ').replace(/<[^>]+>/g, ''),
+        sync: state.lastSync
       },
       settings: state.settings
     };
@@ -796,6 +921,11 @@
         else setShift(msg.value || 0);
         toast('Сдвиг: ' + (state.shift > 0 ? '+' : '') + state.shift.toFixed(2) + ' с');
         return { ok: true, shift: state.shift };
+      case 'AUTO_SYNC':
+        return autoSync(msg);
+      case 'CANCEL_SYNC':
+        stopSync('Подгонка остановлена');
+        return { ok: true };
       case 'CLEAR':
         clearSubs();
         return { ok: true };
@@ -814,12 +944,12 @@
         return true;
       }
       if (msg.type === 'OS_PING') {
-        sendResponse({ ok: true, os: isOpenSubtitles(), url: location.href, ready: document.readyState });
+        sendResponse({ ok: true, os: isProviderSite(), url: location.href, ready: document.readyState });
         return true;
       }
       if (msg.type === 'OS_SHOWS' || msg.type === 'OS_COLLECT' || msg.type === 'OS_FETCH' ||
           msg.type === 'OS_DOC' || msg.type === 'OS_BIN') {
-        if (!isOpenSubtitles() || window.top !== window) return; // отвечает только страница сайта
+        if (!isProviderSite() || window.top !== window) return; // отвечает только страница сайта
         if (msg.type === 'OS_SHOWS') { sendResponse(osShows()); return true; }
         var work = msg.type === 'OS_COLLECT' ? osCollect()
           : msg.type === 'OS_DOC' ? osDoc(msg.url)
@@ -856,8 +986,10 @@
   // Работает только на самом сайте: расширение открывает нужную страницу
   // в фоновой вкладке, а разбор идёт здесь, уже в браузере пользователя.
 
-  function isOpenSubtitles() {
-    return /(^|\.)opensubtitles\.com$/.test(location.hostname);
+  // Через страницу какого сайта попап может ходить за субтитрами.
+  function isProviderSite() {
+    return /(^|\.)opensubtitles\.com$/.test(location.hostname) ||
+      /(^|\.)animetosho\.org$/.test(location.hostname);
   }
 
   function sleep(ms) {
@@ -987,6 +1119,7 @@
     loadFromText: loadFromText,
     info: localInfo,
     setShift: setShift,
+    autoSync: autoSync,
     refreshVideos: refreshVideos,
     getHost: function () { return host; }
   };
