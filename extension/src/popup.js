@@ -426,7 +426,10 @@
     showRow: document.getElementById('osShowRow'),
     show: document.getElementById('osShow'),
     status: document.getElementById('osStatus'),
-    results: document.getElementById('osResults')
+    results: document.getElementById('osResults'),
+    check: document.getElementById('osCheck'),
+    forget: document.getElementById('osForget'),
+    cacheLine: document.getElementById('osCacheLine')
   };
   var osBusy = false;
   var osShows = [];
@@ -532,7 +535,7 @@
         var take = document.createElement('button');
         take.textContent = 'Взять';
         take.title = 'Скачать и сразу наложить на видео';
-        take.addEventListener('click', function () { osTake(l.best.url, take); });
+        take.addEventListener('click', function () { osTake(l.best.url, take, l.code); });
         row.appendChild(take);
 
         var open = document.createElement('a');
@@ -721,10 +724,18 @@
       return;
     }
 
+    // сначала свой архив: если эта серия уже качалась, сайты не нужны
+    var want = os.lang.value;
+    var cached = await SubCache.get(currentKey(want));
+    if (cached && cached.text) {
+      await action({ type: 'LOAD_TEXT', text: cached.text, name: cached.name, encoding: cached.encoding });
+      osSay('Взял из вашего архива: ' + cached.name + ' — ' + cached.count + ' реплик.');
+      setTimeout(async function () { apply(await ping()); }, 200);
+      return;
+    }
+
     var data = await osRun();
     if (!data || !data.languages || !data.languages.length) return;
-
-    var want = os.lang.value;
     var pick = data.languages.filter(function (l) { return l.code === want; })[0] ||
       data.languages.filter(function (l) { return String(l.code).split('-')[0] === want; })[0];
     if (!pick) {
@@ -734,10 +745,10 @@
     if (!pick.best) { osSay('Для этого языка не нашлось ссылки на файл.', 'warn'); return; }
 
     var fake = { textContent: '', disabled: false };
-    await osTake(pick.best.url, fake);
+    await osTake(pick.best.url, fake, pick.code || want);
   }
 
-  async function osTake(subtitleUrl, btn) {
+  async function osTake(subtitleUrl, btn, lang) {
     if (osBusy) return;
     if (!target) { osSay('Сначала откройте вкладку с видео — субтитры некуда накладывать.', 'warn'); return; }
     osBusy = true;
@@ -773,7 +784,8 @@
 
       if (!res || !res.ok) throw new Error(why || 'Скачать не удалось.');
       await action({ type: 'LOAD_TEXT', text: res.text, name: res.name, encoding: res.encoding });
-      osSay('Загружено: ' + res.name + ' — ' + res.count + ' реплик.');
+      await remember(res, lang);
+      osSay('Загружено: ' + res.name + ' — ' + res.count + ' реплик. Файл сохранён в архив.');
       setTimeout(async function () { apply(await ping()); }, 200);
     } catch (e) {
       osSay((e && e.message) || String(e), 'warn');
@@ -786,9 +798,112 @@
   }
 
 
+  // ---------- личный архив субтитров ----------
+
+  function currentKey(lang) {
+    return SubCache.key(os.query.value.trim(), os.season.value, os.episode.value,
+      lang || os.lang.value);
+  }
+
+  function showCacheLine() {
+    SubCache.stats().then(function (st) {
+      if (!st || !st.count) { os.cacheLine.textContent = 'Архив пуст — всё скачанное будет складываться сюда.'; return; }
+      os.cacheLine.textContent = 'В архиве: ' + st.count + ' файл(ов), ' +
+        st.shows + ' назван. , ' + Math.round(st.bytes / 1024) + ' КБ.';
+    });
+  }
+
+  // Кладём в архив то, что удалось скачать, — вместе с названием и серией.
+  function remember(res, lang) {
+    var q = os.query.value.trim();
+    if (!q || !os.episode.value) return Promise.resolve(null);
+    return SubCache.put(currentKey(lang), {
+      name: res.name, text: res.text, encoding: res.encoding,
+      count: res.count, source: res.source || ''
+    }).then(function (row) { showCacheLine(); return row; });
+  }
+
+  // ---------- проверка связи ----------
+
+  // Отдельная кнопка, которая проходит всю цепочку по шагам и говорит,
+  // где именно всё ломается. Иначе на «не работает» нечего ответить.
+  async function selfTest() {
+    if (osBusy) return;
+    osBusy = true;
+    os.check.disabled = true;
+    os.results.innerHTML = '';
+    var report = document.createElement('div');
+    report.className = 'osempty';
+    report.style.whiteSpace = 'pre-line';
+    report.style.textAlign = 'left';
+    os.results.appendChild(report);
+    var lines = [];
+    function say(text) { lines.push(text); report.textContent = lines.join('\n'); }
+
+    async function step(name, job) {
+      try {
+        var detail = await job();
+        say('✔ ' + name + (detail ? ' — ' + detail : ''));
+        return true;
+      } catch (e) {
+        say('✘ ' + name + ' — ' + ((e && e.message) || e));
+        return false;
+      }
+    }
+
+    osSay('Проверяю по шагам…');
+    var view = null;
+
+    await step('AnimeTosho: лента серий', async function () {
+      var list = await Tosho.searchEpisode({
+        query: 'Frieren', season: 1, episode: 1, maxReleases: 1,
+        onStep: function () {}
+      });
+      view = list;
+      return 'нашлось файлов субтитров: ' + list.rows.length;
+    });
+
+    if (view && view.rows.length) {
+      await step('AnimeTosho: скачивание и распаковка', async function () {
+        var pick = view.rows.filter(function (r) { return r.code === 'en'; })[0] || view.rows[0];
+        var got = await Tosho.download(pick.url);
+        if (!got.ok) throw new Error(got.error);
+        return got.name + ', реплик: ' + got.count;
+      });
+    }
+
+    await step('OpenSubtitles: страница поиска', async function () {
+      var doc = await OsNet.fetchDoc(OpenSubs.buildTitleSearchUrl('Frieren'));
+      var shows = OpenSubs.parseShows(doc);
+      return 'сериалов в ответе: ' + shows.length;
+    });
+
+    await step('Архив на вашем диске', async function () {
+      var probe = 'проверка ' + extVersion();
+      await SubCache.put('__selftest__', { name: 'test', text: probe, encoding: 'utf-8', count: 0 });
+      var back = await SubCache.get('__selftest__');
+      await SubCache.remove('__selftest__');
+      if (!back || back.text !== probe) throw new Error('запись не читается обратно');
+      return 'запись и чтение работают';
+    });
+
+    say('');
+    say('Если строка с ✘ — покажите её мне, по ней сразу видно, что чинить.');
+    osSay('Проверка закончена.');
+    os.check.disabled = false;
+    osBusy = false;
+  }
+
+  os.check.addEventListener('click', selfTest);
+  os.forget.addEventListener('click', async function () {
+    await SubCache.clear();
+    showCacheLine();
+    osSay('Архив очищен.');
+  });
+
   os.toggle.addEventListener('click', function () {
     os.panel.classList.toggle('hidden');
-    if (!os.panel.classList.contains('hidden')) os.query.focus();
+    if (!os.panel.classList.contains('hidden')) { os.query.focus(); showCacheLine(); }
   });
   os.search.addEventListener('click', function () { osRun(); });
   os.auto.addEventListener('click', osAutoRun);
