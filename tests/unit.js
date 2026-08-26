@@ -379,6 +379,24 @@ async function grabError(fn) {
   globalThis.fetch = realFetch;
 }
 
+// ---------- личный архив субтитров ----------
+
+const C = require(path.join(__dirname, '..', 'extension', 'src', 'subcache.js'));
+
+check('Ключ архива: название приводится к общему виду',
+  C.key('Mushoku Tensei: Jobless Reincarnation!', 1, 3, 'en'),
+  'mushoku tensei jobless reincarnation|1|3|en');
+check('Ключ архива: разное написание названия даёт один ключ',
+  C.key('  MUSHOKU   tensei ', '1', '3', 'EN'), C.key('Mushoku Tensei', 1, 3, 'en'));
+check('Ключ архива: разные серии не смешиваются',
+  C.key('Show', 1, 3, 'en') === C.key('Show', 1, 4, 'en'), false);
+check('Ключ архива: разные языки не смешиваются',
+  C.key('Show', 1, 3, 'en') === C.key('Show', 1, 3, 'ru'), false);
+check('Ключ архива: без сезона и серии подставляются нули',
+  C.key('Show', null, null, 'en'), 'show|0|0|en');
+check('Ключ архива: русское название тоже нормализуется',
+  C.key('Ван-Пис', 1, 1, 'ru'), 'ван пис|1|1|ru');
+
 // ---------- AnimeTosho: подбор раздачи и разбор вложений ----------
 
 const T = require(path.join(__dirname, '..', 'extension', 'src', 'tosho.js'));
@@ -581,6 +599,8 @@ function fakeEpisode(opts) {
   ok('Попап подключает сетевой модуль поиска', popupHtml.indexOf('osnet.js') !== -1);
   ok('Попап подключает AnimeTosho и распаковку .xz',
     popupHtml.indexOf('tosho.js') !== -1 && popupHtml.indexOf('unxz.js') !== -1);
+  ok('Попап подключает личный архив', popupHtml.indexOf('subcache.js') !== -1);
+  ok('В попапе есть кнопка проверки связи', popupHtml.indexOf('osCheck') !== -1);
   ok('Файл сетевого модуля на месте',
     fs.existsSync(path.join(__dirname, '..', 'extension', 'src', 'osnet.js')));
 }

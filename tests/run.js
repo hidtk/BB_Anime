@@ -80,6 +80,32 @@ async function overlayText(page) {
   const osValidation = await popup.textContent('#osStatus');
   check('Попап: поиск без названия просит ввести название',
     /Введите название/.test(osValidation || ''), osValidation);
+  // ---- личный архив субтитров живёт в базе браузера ----
+  const cacheRound = await popup.evaluate(async () => {
+    const k = SubCache.key('Тестовый сериал', 1, 3, 'en');
+    await SubCache.clear();
+    const miss = await SubCache.get(k);
+    await SubCache.put(k, { name: 'test.srt', text: '1\n00:00:01,000 --> 00:00:02,000\nHi\n', encoding: 'utf-8', count: 1 });
+    const hit = await SubCache.get(k);
+    const st = await SubCache.stats();
+    await SubCache.clear();
+    const after = await SubCache.stats();
+    return {
+      missWasEmpty: miss === null,
+      name: hit && hit.name,
+      count: hit && hit.count,
+      saved: st && st.count,
+      cleared: after && after.count,
+      keyKeepsEpisode: k.indexOf('|1|3|en') !== -1
+    };
+  });
+  check('Архив: пустой ключ ничего не возвращает', cacheRound.missWasEmpty === true, JSON.stringify(cacheRound.missWasEmpty));
+  check('Архив: записанный файл читается обратно', cacheRound.name, 'test.srt');
+  check('Архив: счётчик реплик сохраняется', cacheRound.count, 1);
+  check('Архив: сводка видит запись', cacheRound.saved, 1);
+  check('Архив: очистка убирает всё', cacheRound.cleared === 0, String(cacheRound.cleared));
+  check('Архив: ключ содержит сезон, серию и язык', cacheRound.keyKeepsEpisode, true);
+
   await popup.click('#osToggle');
   await sleep(200);
 
