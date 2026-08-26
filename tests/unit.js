@@ -379,6 +379,181 @@ async function grabError(fn) {
   globalThis.fetch = realFetch;
 }
 
+// ---------- AnimeTosho: подбор раздачи и разбор вложений ----------
+
+const T = require(path.join(__dirname, '..', 'extension', 'src', 'tosho.js'));
+
+check('Запрос к серии идёт с ведущим нулём',
+  T.queriesFor('Mushoku Tensei', 1, 3)[0], 'Mushoku Tensei 03');
+check('Для второго сезона пробуется и запись S02E03',
+  T.queriesFor('Mushoku Tensei', 2, 3).some(q => /S02E03/.test(q)), true);
+check('Без номера серии остаётся одно название',
+  T.queriesFor('Frieren', null, null), ['Frieren']);
+
+check('Номер серии из базы AniDB берётся по большинству раздач',
+  T.dominantEid([{ anidb_eid: 5 }, { anidb_eid: 7 }, { anidb_eid: 7 }, {}]), '7');
+check('Если номеров нет — честный null', T.dominantEid([{}, { title: 'x' }]), null);
+
+check('Раздача известной группы с дорожками ценится выше',
+  T.rankEntries([
+    { id: 1, title: 'Random.Encode.S01E03.mp4', torrent_downloaded_count: 100 },
+    { id: 2, title: '[Erai-raws] Show - 03 [1080p][Multiple Subtitle].mkv', torrent_downloaded_count: 10 }
+  ]).map(e => e.id),
+  [2, 1]);
+
+function fakeLink(label, href) {
+  return {
+    textContent: label,
+    getAttribute: function (a) { return a === 'href' ? href : null; }
+  };
+}
+function fakeToshoDoc(links) {
+  return { querySelectorAll: function () { return links; } };
+}
+{
+  const doc = fakeToshoDoc([
+    fakeLink('English [eng, ASS]', '/storage/attach/001e56e0/Show%20-%2003_track3.eng.ass.xz'),
+    fakeLink('Russian [rus, SRT]', 'https://animetosho.org/storage/attach/001e56e1/Show%20-%2003_track4.rus.srt.xz'),
+    fakeLink('Font [ttf]', '/storage/attach/001e56e9/font.ttf.xz')
+  ]);
+  const att = T.parseAttachments(doc, '[Erai-raws] Show - 03');
+  check('Вложения: шрифты и прочий мусор отсеиваются', att.length, 2);
+  check('Вложения: язык распознан по метке', att.map(a => a.code), ['en', 'ru']);
+  check('Вложения: имя файла без .xz', att[0].name, 'Show - 03_track3.eng.ass');
+  check('Вложения: относительная ссылка достроена',
+    att[0].url, 'https://animetosho.org/storage/attach/001e56e0/Show%20-%2003_track3.eng.ass.xz');
+  check('Вложения: абсолютная ссылка не портится',
+    att[1].url.indexOf('https://animetosho.org/storage/attach/001e56e1/') === 0, true);
+  check('Вложения: помнят, из какой раздачи взяты', att[0].release, '[Erai-raws] Show - 03');
+}
+
+check('Ссылки AnimeTosho узнаются', T.handles('https://animetosho.org/storage/attach/1/x.ass.xz'), true);
+check('Ссылки с поддомена тоже узнаются',
+  T.handles('https://storage.animetosho.org/attach/1/x.ass.xz'), true);
+check('Чужие ссылки не перехватываются',
+  T.handles('https://www.opensubtitles.com/en/subtitles/123/x'), false);
+
+// ---------- распаковка .xz (субтитры с AnimeTosho) ----------
+
+const XZ = require(path.join(__dirname, '..', 'extension', 'src', 'unxz.js'));
+
+{
+  const fs = require('fs');
+  const read = f => new Uint8Array(fs.readFileSync(path.join(__dirname, f)));
+
+  ok('Файл .xz узнаётся по подписи', XZ.isXz(read('xz-sample.ass.xz')));
+  ok('Обычный текст за .xz не принимается', !XZ.isXz(Buffer.from('1\n00:00:01,000 --> ')));
+
+  const ass = Buffer.from(XZ.decompress(read('xz-sample.ass.xz')));
+  const wantAss = fs.readFileSync(path.join(__dirname, '..', 'examples', 'пример.ass'));
+  ok('Распакованный .ass совпадает с исходником байт в байт', ass.equals(wantAss),
+    'получено ' + ass.length + ', ожидалось ' + wantAss.length);
+
+  // многоблочный файл: одна строка повторяется 900 раз
+  const line = 'Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,Line of dialogue\n';
+  const multi = Buffer.from(XZ.decompress(read('xz-multi.xz')));
+  ok('Многоблочный .xz распаковывается целиком', multi.equals(Buffer.from(line.repeat(900))),
+    'получено ' + multi.length);
+
+  // плохо сжимаемые данные — проверяем и куски, которые лежат как есть
+  let x = 7;
+  const noise = Buffer.alloc(20000);
+  for (let i = 0; i < noise.length; i++) {
+    x = (x * 1664525 + 1013904223) >>> 0;
+    noise[i] = (x >>> 24) & 0xFF;
+  }
+  const got = Buffer.from(XZ.decompress(read('xz-noise.xz')));
+  ok('Несжимаемые данные распаковываются точно', got.equals(noise),
+    'получено ' + got.length + ', ожидалось ' + noise.length);
+
+  let broke = null;
+  try { XZ.decompress(Buffer.from('это просто текст, а не архив')); }
+  catch (e) { broke = e.message; }
+  ok('Не-архив отвергается с понятной ошибкой', /не файл \.xz/.test(broke || ''), broke);
+}
+
+// ---------- автоподгонка субтитров по звуку ----------
+
+const SS = require(path.join(__dirname, '..', 'extension', 'src', 'subsync.js'));
+
+// Простой генератор псевдослучайных чисел: тест должен быть повторяемым.
+function rng(seed) {
+  let x = seed >>> 0;
+  return function () {
+    x = (x * 1664525 + 1013904223) >>> 0;
+    return x / 4294967296;
+  };
+}
+
+// Делаем «серию»: реплики в файле и запись громкости с известным сдвигом.
+function fakeEpisode(opts) {
+  const o = Object.assign({ shift: 0, seconds: 120, seed: 7, noise: 0.02, music: 0 }, opts || {});
+  const rand = rng(o.seed);
+  const cues = [];
+  let t = 3;
+  while (t < o.seconds - 6) {
+    const len = 1.1 + rand() * 1.4;
+    cues.push({ start: t, end: t + len, html: 'x' });
+    t += len + 0.35 + rand() * 1.2;
+  }
+  const samples = [];
+  for (let time = 0; time <= o.seconds; time += 0.04) {
+    const fileTime = time - o.shift;
+    const speaking = cues.some(c => fileTime >= c.start && fileTime <= c.end);
+    let level = 0.05 + rand() * o.noise;
+    if (speaking) level += 0.30 + rand() * 0.12;
+    // фоновая музыка: медленная волна, которая мешает простому порогу
+    if (o.music) level += o.music * (0.5 + 0.5 * Math.sin(time / 7));
+    samples.push({ time: time, level: level });
+  }
+  return { cues, samples };
+}
+
+{
+  const env = SS.cueEnvelope([{ start: 1, end: 2 }, { start: 5, end: 5.5 }], 0, 0.5, 12);
+  check('Дорожка реплик отмечает занятые отрезки',
+    Array.from(env).join(''), '001110000011');
+}
+
+{
+  const ep = fakeEpisode({ shift: 2.6 });
+  const res = SS.estimateShift({ samples: ep.samples, cues: ep.cues });
+  ok('Сдвиг вперёд найден', res.ok && Math.abs(res.shift - 2.6) <= 0.12, JSON.stringify(res));
+}
+
+{
+  const ep = fakeEpisode({ shift: -4.32, seed: 21 });
+  const res = SS.estimateShift({ samples: ep.samples, cues: ep.cues });
+  ok('Сдвиг назад найден', res.ok && Math.abs(res.shift + 4.32) <= 0.12, JSON.stringify(res));
+}
+
+{
+  const ep = fakeEpisode({ shift: 1.8, seed: 33, music: 0.12, noise: 0.06 });
+  const res = SS.estimateShift({ samples: ep.samples, cues: ep.cues });
+  ok('Музыка и шум не сбивают подгонку', res.ok && Math.abs(res.shift - 1.8) <= 0.16, JSON.stringify(res));
+}
+
+{
+  const ep = fakeEpisode({ shift: 0, seed: 5 });
+  const rand = rng(99);
+  const noise = ep.samples.map(s => ({ time: s.time, level: 0.05 + rand() * 0.4 }));
+  const res = SS.estimateShift({ samples: noise, cues: ep.cues });
+  ok('Из чистого шума сдвиг не выдумывается', !res.ok, JSON.stringify(res));
+}
+
+{
+  const ep = fakeEpisode({ shift: 3, seconds: 20 });
+  const res = SS.estimateShift({ samples: ep.samples.slice(0, 120), cues: ep.cues });
+  ok('Слишком короткая запись честно отклоняется', !res.ok, JSON.stringify(res));
+  check('Причина отказа названа по-человечески', typeof res.reason === 'string' && res.reason.length > 3, true);
+}
+
+{
+  const ep = fakeEpisode({ shift: 2 });
+  const res = SS.estimateShift({ samples: ep.samples, cues: ep.cues.slice(0, 3) });
+  ok('Без достаточного числа реплик подгонка не запускается', !res.ok, JSON.stringify(res));
+}
+
 // ---------- манифест расширения ----------
 
 {
@@ -386,8 +561,15 @@ async function grabError(fn) {
   const m = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'extension', 'manifest.json'), 'utf8'));
   check('Манифест: третья версия', m.manifest_version, 3);
   check('Манифест: разрешения минимальны', m.permissions.sort(), ['activeTab', 'scripting', 'storage']);
-  check('Манифест: доступ к сайту субтитров запрошен явно',
-    m.host_permissions, ['https://www.opensubtitles.com/*']);
+  // Права должны оставаться узкими: только конкретные сайты субтитров,
+  // никаких «любых страниц» сверх content script.
+  const hosts = m.host_permissions || [];
+  ok('Манифест: доступ запрошен только к сайтам субтитров',
+    hosts.length > 0 && hosts.length <= 3 &&
+    hosts.every(h => /^https:\/\/[^*]/.test(h) || /^https:\/\/\*\.[a-z0-9-]+\.[a-z]{2,}\/\*$/.test(h)),
+    JSON.stringify(hosts));
+  ok('Манифест: сайт субтитров opensubtitles разрешён',
+    hosts.some(h => h.indexOf('opensubtitles.com') !== -1), JSON.stringify(hosts));
   check('Манифест: content script во всех фреймах', m.content_scripts[0].all_frames, true);
   ok('Манифест: все файлы скриптов на месте',
     m.content_scripts[0].js.every(f => fs.existsSync(path.join(__dirname, '..', 'extension', f))));
@@ -397,6 +579,8 @@ async function grabError(fn) {
     fs.existsSync(path.join(__dirname, '..', 'extension', m.action.default_popup)));
   const popupHtml = fs.readFileSync(path.join(__dirname, '..', 'extension', 'src', 'popup.html'), 'utf8');
   ok('Попап подключает сетевой модуль поиска', popupHtml.indexOf('osnet.js') !== -1);
+  ok('Попап подключает AnimeTosho и распаковку .xz',
+    popupHtml.indexOf('tosho.js') !== -1 && popupHtml.indexOf('unxz.js') !== -1);
   ok('Файл сетевого модуля на месте',
     fs.existsSync(path.join(__dirname, '..', 'extension', 'src', 'osnet.js')));
 }
